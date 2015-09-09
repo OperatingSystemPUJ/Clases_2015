@@ -67,11 +67,8 @@ int main(){
     
 
     if(connect(clientSocket, (struct sockaddr *) &serverAddr, addr_size)<0){
-
         printf("Error no se encontro el servidor...\n");
-
         exit(1);
-
     }
 
 
@@ -79,51 +76,28 @@ int main(){
     //strcpy(buffer,"20|QWERTY1234|9876789545A|350000\n");
 
     while(1){
-
         printf("Ingrese sus datos:\n");
-
         printf("Recuerde que el formato es CustomerID|TransactionID|CardNumber|Value \n");
-
         //All the buffer's bits set to zero
-
         memset(buffer, '\0', 1024);
-
         fgets(buffer,1023,stdin);
-
-        
-
         if(connect(clientSocket, (struct sockaddr *) &serverAddr, addr_size)<0){
-
             printf("Error no se encontro el servidor...\n");
-
             exit(1);        
-
         } 
 
         //Send to server the msg
 
         send(clientSocket, buffer,strlen(buffer),0); 
-
         //Read the message from the server into the buffer
-
         recv(clientSocket, buffer, 1024, 0);
-
         // Print the received message ----*/
-
         if(buffer=="202"){
-
             printf("Datos Recibidos!\n");   
-
         }
-
         else{
-
             printf("Los datos no cumplian los requisitos");
-
         }
-
         return 0;
-
     }     
-
 }
