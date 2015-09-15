@@ -109,59 +109,69 @@ void validator_service(void){
     char *sql_tmp;
     const char *tail;
     int error = 0;    
-    //int rec_count = 0;
-    //int search=0;
+    int var_card_number;
+    int var_amount;
+    int var_cash;
+    int var_customer_id;
+    FILE* in;
+    extern FILE *popen();
     //Query to get all the unfinished transactions
     error = sqlite3_open("purchase_service.db", &conn);
     if (error){
         syslog (LOG_ERR, "[Validator Service]: Error can not open database...");
         exit(0);
     }
-    error = sqlite3_prepare_v2(conn,
-        "select card_number, amount from requests where status=0",
-        1000, &res, NULL);
-    while(sqlite3_step(res)==SQLITE_ROW){
-        printf("%s|", sqlite3_column_text(res, 0));
-        printf("%u\n", sqlite3_column_int(res, 1));
-    }
-    if (error != SQLITE_OK){
-        puts("We did not get any data!");
-        exit(0);
-    }
-
-
-    //Check all the unfinished transactions
-    while (sqlite3_step(res) == SQLITE_ROW){
-        //get the information from the db of the cards
-         //char** card_number=sqlite3_column_text(res, 0);
-
-        error = sqlite3_prepare_v2(conn,
-            "select cash from cards where card_number=1", 1000, &res1, &tail);
-        if (error != SQLITE_OK){
-            puts("We did not get any data!");
-            exit(0);
-        }
-        while(sqlite3_step(res)==SQLITE_ROW){
-            printf("%u\n", sqlite3_column_int(res1, 0));
-        }
-
-        //If the cash in the person's account is greater than the amount then...
-        if(sqlite3_column_text(res1, 1)>=sqlite3_column_text(res, 1)){
-            //update the cash in the account
-            ///int cash=sqlite3_column_int(res, 1);
-            printf("ENTRO AL UPDATE \n");
-            error = sqlite3_exec(conn,
-                         "update cards set cash=1 where card_number=1",
-                         0, 0, 0);
+    while(1){
+        sqlite3_prepare_v2(conn,
+            "select card_number, amount, customer_id from requests where status=0", 1000, &res, NULL);        
+        //Check all the unfinished transactions
+        printf("HACE SELECCION DE DATOS DE LAS TARJETAS \n");
+        if (sqlite3_step(res) == SQLITE_ROW){
+            //get the information from the db of the cards
+             //char** card_number=sqlite3_column_text(res, 0);
+            //Vars  update
+            var_card_number=sqlite3_column_int(res,0);
+            var_amount=sqlite3_column_int(res,1);
+            var_customer_id=sqlite3_column_int(res,2);
+            printf("customer_id: %d\n",var_customer_id );
             // update the status to ok
-            error = sqlite3_exec(conn,
-                        "update requests set status=1 where card_number=1",
-                         0, 0, 0);
+            sqlite3_prepare_v2(conn,"update requests SET status=1 WHERE customer_id=?1",-1, &res, NULL);
+            sqlite3_bind_int(res,1,var_customer_id);
+            sqlite3_prepare_v2(conn,
+                "select cash from cards where card_number=?1", 1000, &res1, &tail);
+            //bind vars
+            sqlite3_bind_int(res1,1,var_card_number);
+            var_cash=sqlite3_column_int(res1,1);
+            //If the cash in the person's account is greater than the amount then...
+            printf("HAY FILAS \n");
+            if(var_cash>=var_amount){
+
+                //update the cash in the account
+                ///int cash=sqlite3_column_int(res, 1);
+                
+                sqlite3_prepare_v2(conn,
+                             "update cards SET cash=?1 WHERE card_number=?2",-1, &res1, NULL);
+                int saldot=var_cash-var_amount;
+                sqlite3_bind_int(res1,1,saldot);
+                sqlite3_bind_int(res1,2,var_card_number);
+                if(!(in = popen("echo \"Transaccion exitosa\" | mailx -v -r \"pruebasisoper@gmail.com\" -s \"Banco de los Sistemas Operativos\" -S smtp=\"smtp.gmail.com:587\" -S smtp-use-starttls -S smtp-auth=login -S smtp-auth-user=\"pruebasisoper@gmail.com\" -S smtp-auth-password=\"sisoper123\" -S ssl-verify=ignore sebaslh12@gmail.com", "r"))){
+                        exit(1);
+                    }
+                else{
+                    if(!(in = popen("echo \"Usted no posee saldo para realizar la compra\" | mailx -v -r \"pruebasisoper@gmail.com\" -s \"Banco de los Sistemas Operativos\" -S smtp=\"smtp.gmail.com:587\" -S smtp-use-starttls -S smtp-auth=login -S smtp-auth-user=\"pruebasisoper@gmail.com\" -S smtp-auth-password=\"sisoper123\" -S ssl-verify=ignore sebaslh12@gmail.com", "r"))){
+                        exit(1);
+                    }
+                }
+
+            }
+            else{
+                code=NOT_ACCEPTABLE;
+            }            
         }
-        else{
-            code=NOT_ACCEPTABLE;
-        }        
+        sleep(10);
     }
+    pclose(in);
+    sqlite3_close(conn);
     syslog (LOG_INFO, "[Validator Service]: Started...");
 }
 ////////////////////////////////////////////////////////////////////////////////
