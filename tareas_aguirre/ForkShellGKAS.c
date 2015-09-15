@@ -12,7 +12,7 @@ int main()
 {
     char cmd[1024];
     char *args[64];
-    int pid, slstate;
+    int pid, state;
 
     while (1) 
     {    
