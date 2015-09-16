@@ -22,15 +22,15 @@
 #include <time.h>
 
 #define NTHREADS      4
-#define ARRAYSIZE   10
+#define ARRAYSIZE   256
 #define ITERATIONS   ARRAYSIZE / NTHREADS
 
-int buffer[ARRAYSIZE]
+struct  timeval  t0 , t1;
+
+int buffer[ARRAYSIZE];
 pthread_mutex_t sum_mutex;
 
 int c=0;
-
-struct  timeval  t0 , t1;
 
 void *do_work(void *tid) 
 {
@@ -42,12 +42,19 @@ void *do_work(void *tid)
    
    while(1){
       pthread_mutex_lock (&sum_mutex); //seccion critica
-      gettimeofday(&t1 , NULL);
-      unsigned  int  ut1 = t1.tv_sec *1000000+ t1.tv_usec ;
-      unsigned  int  ut0 = t0.tv_sec *1000000+ t0.tv_usec ;
-      int tmp=(ut1 -ut0)/100;
-      buffer[c]=tmp;
-      printf ("Thread %d put %d in position %d\n",*mytid,tmp,c); 
+      if (c-1==ARRAYSIZE)
+      {
+         pthread_mutex_unlock (&sum_mutex); //seccionciritica
+         break;   
+      }
+      //gettimeofday(&t1 , NULL);
+      //unsigned  int  ut1 = t1.tv_sec *1000000+ t1.tv_usec ;
+      //unsigned  int  ut0 = t0.tv_sec *1000000+ t0.tv_usec ;
+      //int tmp=(ut1 -ut0)/100;
+      buffer[c]=c;
+      //printf ("Thread %d put %d in position %d\n",*mytid,tmp,c); 
+      printf ("Thread %d put in position %d\n",*mytid,c); 
+      c++;
       pthread_mutex_unlock (&sum_mutex); //seccionciritica
       sleep(1);
    }
@@ -60,7 +67,7 @@ int main(int argc, char *argv[])
    pthread_t threads[NTHREADS];
    pthread_attr_t attr;
 
-   gettimeofday(&t0, NULL);
+   //gettimeofday(&t0, NULL);
 
    /* Pthreads setup: initialize mutex and explicitly create threads in a
     joinable state (for portability).  Pass each thread its loop offset */
@@ -68,8 +75,8 @@ int main(int argc, char *argv[])
    pthread_attr_init(&attr);
    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
    for (i=0; i<NTHREADS; i++) {
-   tids[i] = i;
-   pthread_create(&threads[i], &attr, do_work, (void *) &tids[i]);
+      tids[i] = i;
+      pthread_create(&threads[i], &attr, do_work, (void *) &tids[i]);
    }
 
    /* Wait for all threads to complete then print global sum */ 
@@ -79,11 +86,12 @@ int main(int argc, char *argv[])
    for ( i = 0; i < ARRAYSIZE; ++i)
    {
       printf("%d|",buffer[i]);  
-      if (i%10==0)
+      if (i%10==0 && i!=0)
       {
          printf("\n");
       }
    }
+   printf("\n");
 
    /* Clean up and exit */
    pthread_attr_destroy(&attr);
