@@ -48,7 +48,7 @@ int main(int argc, char *argv[])
 	pthread_t prod_t, cons_t;
 	srand(time(0));  /* initialize a random number generator */
 	/* initialize a semaphores */
-	sem_init(&empty, 0, SIZE);
+	sem_init(&empty, 0, 1);
 	sem_init(&products, 0, 0);
 	/* create producer and consumer threads */
 	pthread_create(&prod_t, NULL, producer, NULL);
