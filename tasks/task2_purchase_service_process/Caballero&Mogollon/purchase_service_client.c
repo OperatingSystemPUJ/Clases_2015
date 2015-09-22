@@ -28,7 +28,7 @@ int main()
     addr_size = sizeof serverAddr;
     connect(clientSocket, (struct sockaddr *) &serverAddr, addr_size);
 
-    strcpy(buffer,"20|QWERTY1234|9876789545A|350000\n");
+    strcpy(buffer,"20|QWERTY1234|9876789545A|100000\n");
     send(clientSocket, buffer,strlen(buffer),0);  
 
 

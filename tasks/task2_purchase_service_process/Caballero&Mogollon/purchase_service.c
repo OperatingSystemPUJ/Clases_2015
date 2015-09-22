@@ -107,7 +107,7 @@ void correo(int valor)
     /* Address family = Internet */
     serverAddr.sin_family = AF_INET;
     /* Set port number, using htons function to use proper byte order */
-    serverAddr.sin_port = htons(4040);
+    serverAddr.sin_port = htons(8891);
     /* Set IP address to localhost */
     serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
     /* Set all bits of the padding field to 0 */
@@ -128,8 +128,7 @@ void correo(int valor)
     /*---- Read the message from the server into the buffer ----*/
     recv(clientSocket, buffer, 1024, 0);
 
-    /*---- Print the received message ----*/
-    printf("Mensaje Enviado: \n");   
+    /*---- Print the received message ----*/ 
 
 }
 
@@ -155,9 +154,7 @@ void validator_service(void)
     int var_saldo;
     int var_status;
     int saldo_temporal;
-    FILE *in;
-    extern FILE *popen();
-    char buff[512];
+    
     while(1){
 
         //////////////////////////////////////////
@@ -197,22 +194,14 @@ void validator_service(void)
                 sqlite3_bind_int(stmt, 1, saldo_temporal);
                 sqlite3_bind_int(stmt, 2, var_customer_id);  
                 sqlite3_step(stmt);
-                valor(1);
-                if(!(in = popen("echo \"Transaccion exitosa\" | mailx -v -r \"pruebasisoper@gmail.com\" -s \"Banco de los Sistemas Operativos\" -S smtp=\"smtp.gmail.com:587\" -S smtp-use-starttls -S smtp-auth=login -S smtp-auth-user=\"pruebasisoper@gmail.com\" -S smtp-auth-password=\"sisoper123\" -S ssl-verify=ignore jfm1094@gmail.com", "r"))){
-                    exit(1);
-                }
+                correo(1);
             }
             else{
-                valor(0);
-                if(!(in = popen("echo \"Saldo insuficiente\" | mailx -v -r \"pruebasisoper@gmail.com\" -s \"Banco de los Sistemas Operativos\" -S smtp=\"smtp.gmail.com:587\" -S smtp-use-starttls -S smtp-auth=login -S smtp-auth-user=\"pruebasisoper@gmail.com\" -S smtp-auth-password=\"sisoper123\" -S ssl-verify=ignore jfm1094@gmail.com", "r"))){
-                    exit(1);
-                }
+                correo(0);
             }
 
 
-            while(fgets(buff, sizeof(buff), in)!=NULL){
-                printf("%s", buff);
-            }
+
             sleep(10);
             
         }
@@ -223,7 +212,6 @@ void validator_service(void)
         quiere y se ebnvia eñ correo.
         El código de envío esta en el message client, y va desde el inicio hasta el segundo else. 
     */
-    pclose(in);
     sqlite3_close(db);
     syslog (LOG_INFO, "[Validator Service]: Started...");
 }
