@@ -1,5 +1,9 @@
 // 3. Ejecutar el siguiente codigo varias veces, que observa? 
-   // Como lo podria arreglar?
+// Como lo podria arreglar?
+//////////////////////////////////////////////////////
+//Respuesta
+//agregandole los mutex necesarios en el acceso a las variables globales que hay en
+//la funcion dotprod, variables que son a y b, que se usan en todos los hilos 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +13,8 @@
 #define VECLEN 100000
 int *a, *b; 
 long sum=0;
+pthread_mutex_t mutex;
+
 
 void *dotprod(void *arg)
 {
@@ -26,8 +32,11 @@ void *dotprod(void *arg)
 
 	/* Perform my section of the dot product */
 	printf("thread: %ld starting. start=%d end=%d\n",tid,start,end-1);
-	for (i=start; i<end ; i++) 
-	  sum += (a[i] * b[i]);
+	for (i=start; i<end ; i++){
+		pthread_mutex_lock (&mutex);
+		sum += (a[i] * b[i]);
+		pthread_mutex_unlock (&mutex);
+	} 
 	printf("thread: %ld done. Global sum now is=%li\n",tid,sum);
 
 	pthread_exit((void*) 0);
@@ -38,7 +47,7 @@ int main (int argc, char *argv[])
 	long i;
 	void *status;
 	pthread_t threads[NUMTHRDS];
-
+	 pthread_mutex_init(&mutex, NULL);
 	/* Assign storage and initialize values */
 	a = (int*) malloc (NUMTHRDS*VECLEN*sizeof(int));
 	b = (int*) malloc (NUMTHRDS*VECLEN*sizeof(int));
