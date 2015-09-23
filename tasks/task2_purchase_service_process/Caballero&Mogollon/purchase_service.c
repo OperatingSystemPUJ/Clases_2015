@@ -142,10 +142,9 @@ void validator_service(void)
     syslog (LOG_INFO, "Starting Validator Service... pid:[%d]", getpid());
 
     sqlite3 *db;
-    sqlite3_stmt *stmt;
+    sqlite3_stmt *stmt,*stmt1;
     sqlite3_stmt *co; 
     char *err_msg = 0;
-    int rc = sqlite3_open("purchase_service.db", &db);
     int var_temporal;
     int error = 0;
     int var_id;
@@ -154,6 +153,12 @@ void validator_service(void)
     int var_saldo;
     int var_status;
     int saldo_temporal;
+    int rc = sqlite3_open("purchase_service.db", &db);
+    if (rc){
+        syslog (LOG_ERR, "[Validator Service]: Error can not open database...");
+        exit(0);
+    }
+    
     
     while(1){
 
@@ -179,10 +184,10 @@ void validator_service(void)
             // se busca el saldo
             sqlite3_prepare_v2(db,
                     "select saldo from cuentas where customer_id=?1",
-                    1000, &stmt, NULL);
-            sqlite3_bind_int(stmt, 1, var_customer_id);
-            sqlite3_step(stmt);
-            var_saldo=sqlite3_column_int(stmt, 0);
+                    1000, &stmt1, NULL);
+            sqlite3_bind_int(stmt1, 1, var_customer_id);
+            sqlite3_step(stmt1);
+            var_saldo=sqlite3_column_int(stmt1, 0);
 
             //se compara si puede realizar la transaccion
             saldo_temporal=var_saldo-var_amount;
@@ -190,10 +195,10 @@ void validator_service(void)
                 sqlite3_prepare_v2(db, 
                            "update cuentas \
                            SET saldo=?1\
-                           WHERE customer_id =?2", -1, &stmt, NULL);
-                sqlite3_bind_int(stmt, 1, saldo_temporal);
-                sqlite3_bind_int(stmt, 2, var_customer_id);  
-                sqlite3_step(stmt);
+                           WHERE customer_id =?2", -1, &stmt1, NULL);
+                sqlite3_bind_int(stmt1, 1, saldo_temporal);
+                sqlite3_bind_int(stmt1, 2, var_customer_id);  
+                sqlite3_step(stmt1);
                 correo(1);
             }
             else{
