@@ -15,9 +15,8 @@ void* average(void *vargp){
 	int *ptr = (int*) vargp;
 	int i=0;	
 	pthread_mutex_lock (&access);
-	for(i=0;i<lenght,i++){
-		av+=ptr[i];
-		i++;
+	for(i=0;i<lenght;i++){
+		av+=ptr[i];		
 		printf("Sum avg %d\n",av );
 	}	
 	av=av/i;	
@@ -31,12 +30,11 @@ void* minimum(void *vargp){
 	int *ptr = (int*) vargp;
 	int i=0;
 	pthread_mutex_lock (&access);	
-	for(i=0;i<lenght,i++){
+	for(i=0;i<lenght;i++){
 		if (ptr[i]<=min){
 			min=ptr[i];			
 			printf("Current min %d\n",min );
-		}
-		i++;
+		}		
 	}	
 	printf("Final min %d\n",min );
 	pthread_mutex_unlock (&access);
@@ -47,12 +45,11 @@ void* maximum(void *vargp){
 	int *ptr = (int*) vargp;
 	int i=0;
 	pthread_mutex_lock (&access);
-	for(i=0;i<lenght,i++){
+	for(i=0;i<lenght;i++){
 		if (ptr[i]>=max){
 			max=ptr[i];	
 			printf("Current max %d\n",max );		
-		}
-		i++;
+		}		
 	}	
 	printf("Final max %d\n",max );
 	pthread_mutex_unlock (&access);
@@ -64,14 +61,12 @@ int main(int argc, char *argv[]){
 	int y, w, start; //tids[SIZE];	
 	pthread_t threads[NTHREADS];
 	pthread_attr_t attr;
-	int tamnum;
-
 	printf("Cuantos numeros ingresara:\n");
 	scanf("%d",&lenght);
 	if (lenght<=0){
 		printf("Cantidad invalida\n");
 		exit(1);
-	}
+	}	
 	int nums[lenght];
 	for (y=0; y < lenght; y++){		
 		int tmp;
