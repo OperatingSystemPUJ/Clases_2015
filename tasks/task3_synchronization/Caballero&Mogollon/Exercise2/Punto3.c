@@ -3,12 +3,7 @@
 #include <stdlib.h>
 
 
-/*
-	El programa original presentaba una zona crítica a la cual accedían todos los hilos sin ninguna
-	dificultad, cambiando el valor de la variable sum. Se agregó un mutex que controle el acceso 
-	a la variable sum dando como resultado lo esperado por el programa, que es que cada hilo sume
-	1000 al valor actual de la variable
-*/
+
 
 /* Define global data where everyone can see them */
 #define NUMTHRDS 8

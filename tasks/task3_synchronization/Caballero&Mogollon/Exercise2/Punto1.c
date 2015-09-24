@@ -14,7 +14,7 @@ en la zona crítica. El código funciona correctamente.
 #define ITERATIONS   ARRAYSIZE / NTHREADS
 
 double  sum=0.0, a[ARRAYSIZE];
-pthread_mutex_t sum_mutex;
+//pthread_mutex_t sum_mutex;
 
 void *do_work(void *tid) 
 {
@@ -32,9 +32,9 @@ void *do_work(void *tid)
 	}
 
 	/* Lock the mutex and update the global sum, then exit */
-	pthread_mutex_lock (&sum_mutex);
+	//pthread_mutex_lock (&sum_mutex);
 	sum = sum + mysum;
-	pthread_mutex_unlock (&sum_mutex);
+	//pthread_mutex_unlock (&sum_mutex);
 	pthread_exit(NULL);
 }
 
@@ -46,7 +46,7 @@ int main(int argc, char *argv[])
 
 	/* Pthreads setup: initialize mutex and explicitly create threads in a
 	 joinable state (for portability).  Pass each thread its loop offset */
-	pthread_mutex_init(&sum_mutex, NULL);
+//	pthread_mutex_init(&sum_mutex, NULL);
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 	for (i=0; i<NTHREADS; i++) {
@@ -68,6 +68,6 @@ int main(int argc, char *argv[])
 
 	/* Clean up and exit */
 	pthread_attr_destroy(&attr);
-	pthread_mutex_destroy(&sum_mutex);
+//	pthread_mutex_destroy(&sum_mutex);
 	pthread_exit (NULL);
 }

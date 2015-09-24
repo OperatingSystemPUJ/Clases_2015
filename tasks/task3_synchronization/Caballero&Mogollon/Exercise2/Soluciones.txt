@@ -1,0 +1,9 @@
+Punto 1:
+Se crean 4 hilos, cada uno se ejecuta en el orden que la máquina disponga y cada uno suma 250000 unidades en la función. Este código presenta una zona crítica, ya que la variable sum se ve usada por todos los hilos, por lo que es necesario establecer un mutex que controle el acceso a la variable sum.
+
+
+Punto 3:
+El programa original presentaba una zona crítica a la cual accedían todos los hilos sin ninguna dificultad, cambiando el valor de la variable sum. Se agregó un mutex que controle el acceso a la variable sum dando como resultado lo esperado por el programa, que es que cada hilo sume 1000 al valor actual de la variable.
+
+Punto 4:
+El programa presentaba un problema que fue corregido, el cual era que el hilo principal no esperaba a que los otros hilos terminaran de ejecutarse y finalizaba.
