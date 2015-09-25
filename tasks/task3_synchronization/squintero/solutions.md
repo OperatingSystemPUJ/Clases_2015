@@ -1,3 +1,12 @@
+## Respuestas de exercise1.txt
+
+1.
+ El primer programa efectivamente imprime 42.
+ El segundo programa no imprime 42 ya que lo devuelve como codigo de status mas no como un parametro de retorno.
+ El tercer programa contiene una condicion de carrera por lo que el valor a imprimir puede ser 42 u otro valor como 0, dependiendo del hilo que modifique el dato de ultimo.
+ El cuarto programa al probarlo en esta maquina especifica retornaba 42, sin embargo segun la especificacion de pthread_join() al llamarse con un hilo que ha sido desenganchado (en este caso con pthread_detach()) los resultados son indefinidos.
+ El quinto programa tambien presenta una condicion de carrera donde solo imprime 42 si el hilo se ejecuta hasta el printf antes que el segundo hilo modifique el valor a 31.
+
 ## Respuestas de exercises2.txt
 
 ### Santiago Quintero
