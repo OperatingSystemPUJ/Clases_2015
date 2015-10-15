@@ -1,0 +1,16 @@
+// Use of uninitialized memory
+// valgrind --tool=memcheck ./val01
+
+#include <stdio.h>
+#include <stdlib.h> 
+
+int main(void)
+{
+    char *p; 
+
+    char c = *p; 
+
+    printf("\n [%c]\n",c); 
+
+    return 0;
+}
