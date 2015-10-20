@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
-#define NTHREADS 10
+#define NTHREADS 100
 //Network IP
 char ipaddr[]="192.168.250.0";
 //Thread IP
@@ -37,10 +37,8 @@ int ping(void) {
 
 void* pingtest(void* actual){
 	int *ptr= (int*) actual;	
-	pthread_mutex_lock (&p);
-	//char str[1];
-	//sprintf(str, "%d", ipactual);
-	ipaddr[12]=ipactual+'0';
+	pthread_mutex_lock (&p);	
+	sprintf(ipaddr,"192.168.250.%d",ipactual);
 	ipactual++;
 	int status=ping();
 	if (status == 0) {
