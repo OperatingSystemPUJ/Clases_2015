@@ -11,7 +11,8 @@
 ///////////////////////////////////
 //Respuesta
 //el codigo hace la suma de los primeros n numeros, el codigo usa los mutex para ayudar en la seccion critica
-//entre los hilos y asi no causar problemas coherencia, por tanto no tiene ningun error.
+//entre los hilos y asi no causar problemas coherencia, lo unico a agregar es un sleep despues del for para que el scheduling 
+//tenga tiempo para lanzar otro hilo y mantener la coherencia
 double  sum=0.0, a[ARRAYSIZE];
 pthread_mutex_t sum_mutex;
 
