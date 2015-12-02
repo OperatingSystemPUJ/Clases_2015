@@ -1,0 +1,7 @@
+Task Summary
+============
+1. Mini-Shell
+2. Purchase-Service
+3. View Clases_2015 -> topics -> threads -> exercise1.txt and exercise2.txt
+4. Make a solution for Readers and writers problem using semaphores (Page 46 - synchronization.pdf).
+5. Ubuntu-load-balancer-haproxy (Page 30 - virtualization.pdf)
