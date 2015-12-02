@@ -11,6 +11,12 @@
 
 2.
  Implementado como matrix.c
+ 
+3.
+ Implementado como statistics.c
+ 
+4.
+ Implementado como ping.c
 
 ## Respuestas de exercises2.txt
 
