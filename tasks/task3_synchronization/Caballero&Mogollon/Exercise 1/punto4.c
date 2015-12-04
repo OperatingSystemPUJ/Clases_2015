@@ -8,6 +8,7 @@
 char* network = "192.168.250.";
 pthread_mutex_t bloqueo;
 int status=0;
+int total=0;
 
 
 int ping(char *ipaddr) {
@@ -38,9 +39,10 @@ int ping(char *ipaddr) {
 
 void *do_ping(void *tid)
 {
-	char * ip = network;
+	char ip [25];
 	pthread_mutex_lock (&bloqueo);
-	
+	total++;
+	sprintf(ip, "192.168.250.%d",total);
 	printf("%s\n",ip );
 	status = ping(ip);
   	if (status == 0) {
@@ -60,11 +62,11 @@ int main(int argc, char *argv[]){
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 	pthread_mutex_init(&bloqueo, NULL);
 	printf("TODO BIEn\n");
-	char * ip = network;
-	printf("TODO BIEn\n");
-	//strcat(ip,"hola");
-	printf("TODO BIEn\n");
-	printf("%s\n",ip );
+	//char ip [25];
+	//printf("TODO BIEn\n");
+	//sprintf(ip, "192.168.250.%d",4);
+	//printf("TODO BIEn\n");
+	//printf("%s\n",ip );
 
 	//char *suma = ip+"hola";
 
