@@ -1,0 +1,2844 @@
+#!/usr/bin/perl
+
+use strict;
+
+use Data::Dumper;
+use POSIX;
+use Socket;
+use Socket6;
+use IO::Socket::UNIX;
+use Time::HiRes qw(gettimeofday tv_interval);
+
+use lib '/var/alertlogic/lib/3.4';
+use AlertLogic::Base::Common;
+use AlertLogic::Base::Database;
+use AlertLogic::Base::HomeNet;
+
+use constant {
+        LT_ETHERNET             => 1,
+        ETHERTYPE_8021Q         => 0x8100,
+        ETHERTYPE_IP            => 0x0800,
+        ETHERTYPE_IPV6          => 0x86dd,
+        IPPROTO_HOPOPTS         => 0,
+        IPPROTO_DSTOPTS         => 60,
+        IPPROTO_ROUTING         => 43,
+        IPPROTO_FRAGMENT        => 44,
+        IPPROTO_ICMP            => 1,
+        IPPROTO_ICMPV6          => 58,
+        IPPROTO_TCP             => 6,
+        IPPROTO_UDP             => 17,
+        TCI_IPV4                => 0x0001,
+        TCI_IPV6                => 0x0002
+};
+
+
+my $sockpath = '/var/alertlogic/etc/event-alert-processor.sock';
+
+# Get our server ID.
+
+our $serverId = 0;
+
+require "/var/alertlogic/etc/queue.server";
+
+# Read the database configuration.
+
+our %dataConfig;
+our %payloadConfig;
+our %queueConfig;
+our %proxyConfig;
+our %summaryConfig;
+
+require "/var/alertlogic/etc/db_config.pl";
+
+# Global variables that manage the current and maximum number of child processes.
+
+my $isChild    = 0;
+my $childCount = 0;
+my $childMax   = 100;
+
+{
+        $SIG{'CHLD'} = \&REAPER;
+
+        my $commonObj = AlertLogic::Base::Common->new();
+
+        $commonObj->daemonize("queue");
+
+        #
+        # Connect to the databases.
+        #
+
+        my $dataObj  = AlertLogic::Base::Database->new(\%dataConfig);
+        my $queueObj = AlertLogic::Base::Database->new(\%queueConfig);
+
+        $dataObj->{'han'}->{'InactiveDestroy'} = 1;
+        $queueObj->{'han'}->{'InactiveDestroy'} = 1;
+
+        while (1)
+        {
+
+                #
+                # Ping the database handles once per loop to keep them open.
+                #
+
+                $dataObj->ping();
+                $queueObj->ping();
+
+                #
+                # Get a list of sensors that have events waiting that
+                # we are able to process.
+                #
+
+                my @sensors = getHandledSensors($dataObj, $serverId);
+                my @waiting = getWaitingSensors($queueObj, \@sensors);
+
+                # print Dumper \@waiting;
+
+                #
+                # Exit if someone has placed the 'die' file on the filesystem.
+                #
+
+                if ( -f '/var/alertlogic/etc/die.queue' )
+                {
+                        last;
+                }
+
+                my $count = $#waiting + 1;
+
+                if ($count <= 0)
+                {
+                        sleep 2;
+
+                        next;
+                }
+
+                #
+                # Group the waiting queues by their sensor ID and pass the batches
+                # to children for insertion into the database.
+                #
+
+                my %queues = getQueues($queueObj, \@waiting);
+
+                foreach my $sensorId (sort { $a <=> $b } keys %queues)
+                {
+                        my $customerId = getCustomerId($dataObj, $sensorId);
+
+                        if ($customerId < 0)
+                        {
+                                next;
+                        }
+
+                        #
+                        # See if we are allowed to fork another child.
+                        #
+
+                        if ($childCount >= $childMax)
+                        {
+                                while ($childCount >= $childMax)
+                                {
+                                        sleep 1;
+                                }
+                        }
+
+                        my @qs = @{ $queues{$sensorId} };       # waiting queues for sensor
+                        my $qn = $#qs + 1;                      # count of waiting queues
+
+                        LOG("Processing $qn queue(s) for sensor $sensorId: " .
+                                        "($childCount + 1 of $childMax)");
+
+                        #
+                        # Lock the selected queues so no other threads can process them.
+                        #
+
+                        if (changeStatus($queueObj, 6, \@qs) < 0)
+                        {
+                                LOG("Unable to lock queues for processing");
+
+                                next;
+                        }
+
+                        #
+                        # Assign the queues to a child process.
+                        #
+
+                        if (processQueues($customerId, $sensorId, \@qs) < 0)
+                        {
+                                LOG("Error processing queues");
+
+                                next;
+                        }
+                }
+        }
+
+        exit 0;
+}
+
+sub REAPER {
+        if ($isChild != 1)
+        {
+                while (waitpid(-1, WNOHANG) > 0)
+                {
+                        $childCount-- if ($childCount > 0);
+                }
+        }
+
+        $SIG{'CHLD'} = \&REAPER;
+}
+
+sub redirectOutput
+{
+        my $sensorId = shift;
+
+        $sensorId = sprintf("%04d", $sensorId);
+
+        open OLDSTDOUT, '>&STDOUT';
+        open OLDSTDERR, '>&STDERR';
+
+        open STDOUT, ">> /var/alertlogic/log/queue-child.${sensorId}";
+        open STDERR, ">&STDOUT";
+
+        select STDOUT; $| = 1;
+}
+
+#
+# Get a list of the sensors assigned to this queue server.
+#
+
+sub getHandledSensors
+{
+        my $dataObj  = shift;
+        my $serverId = shift;
+
+        my $query   = "SELECT sensor_id FROM sensor_tbl WHERE queue_server = ? AND active = 1";
+        my $results = $dataObj->execute($query, $serverId);
+
+        my @r = map { $_->{'sensor_id'} } @{ $results };
+
+        return @r;
+}
+
+#
+# Get a list of the sensors that have queues waiting to be processed.
+#
+
+sub getWaitingSensors
+{
+        my $queueObj = shift;
+        my $sensors  = shift;
+
+        my $sensorCount = $#{ $sensors } + 1;
+        my $sensorList  = join(',', @{ $sensors });
+
+        if ($sensorCount <= 0)
+        {
+                return undef;
+        }
+
+        my $query= "
+                SELECT
+                        sensor_id,
+                        status
+                FROM
+                        director_queue_tbl
+                WHERE
+                        sensor_id IN ($sensorList)
+                AND
+                        status IN (0,5,6)
+                GROUP BY
+                        sensor_id,
+                        status";
+
+        my $results = $queueObj->execute($query);
+
+        my %stats;
+
+        foreach my $result (@{ $results })
+        {
+                my $sensorId = $result->{'sensor_id'};
+                my $status   = $result->{'status'};
+
+                if (($status == 5) || ($status == 6))
+                {
+                        $stats{$sensorId} = 5;
+
+                        next;
+                }
+
+                if (($status == 0) && ($stats{$sensorId} != 5))
+                {
+                        $stats{$sensorId} = 1;
+
+                        next;
+                }
+        }
+
+        my @r;
+
+        foreach my $sensorId (keys(%stats))
+        {
+                if ($stats{$sensorId} == 1)
+                {
+                        push @r, $sensorId;
+                }
+        }
+
+        return @r;
+}
+
+sub getQueues
+{
+        my $queueObj = shift;
+        my $sensors  = shift;
+
+        my $query = "
+                SELECT
+                        director_queue_id
+                FROM
+                        director_queue_tbl
+                WHERE
+                        sensor_id = ? AND
+                        status = 0
+                ORDER BY
+                        director_queue_id
+                LIMIT
+                        500";
+
+        my %r;
+
+        foreach my $sensorId (@{ $sensors })
+        {
+                LOG("Gathering queues for sensor $sensorId");
+
+                my $results = $queueObj->execute($query, $sensorId);
+
+                my @s = map { $_->{'director_queue_id'} } @{ $results };
+
+                my $count = $#s + 1;
+
+                LOG("Found $count queue(s)");
+
+                $r{$sensorId} = \@s;
+        }
+
+        return %r;
+}
+
+#
+# Get the customer ID for a sensor.
+#
+
+sub getCustomerId
+{
+        my $dataObj  = shift;
+        my $sensorId = shift;
+
+        #
+        # Find this sensor's customer ID.
+        #
+
+        my $query   = "SELECT customer_id FROM sensor_tbl WHERE sensor_id = ?";
+        my $results = $dataObj->execute($query, $sensorId);
+
+        if (defined($results->[0]) == 0)
+        {
+                LOG("Unable to find customer ID for sensor $sensorId");
+
+                return -1;
+        }
+
+        my $customerId = $results->[0]->{'customer_id'} || 0;
+
+        if ($customerId == 0)
+        {
+                LOG("Invalid customer ID for sensor $sensorId");
+
+                return -1;
+        }
+
+        return $customerId;
+}
+
+#
+# Get the actual event data from the queue database.
+#
+
+sub getBatch
+{
+        my $queueObj = shift;
+        my $queueId  = shift;
+
+        my $query = "
+                SELECT
+                        director_batch_id,
+                        batch_data,
+                        count
+                FROM
+                        director_batch_tbl
+                WHERE
+                        director_queue_id = ?";
+
+        my $results = $queueObj->execute($query, $queueId);
+
+        if (defined($results->[0]) == 0)
+        {
+                LOG("No batch data for queue $queueId");
+
+                return undef;
+        }
+
+        my $batchId = $results->[0]->{'director_batch_id'} || 0;
+        my $payload = $results->[0]->{'batch_data'}        || undef;
+        my $version = $results->[0]->{'count'}             || 4;
+
+        if (defined($payload) == 0)
+        {
+                LOG("No batch data for queue $queueId");
+        }
+
+        return ( $payload, $version, $batchId );
+}
+
+sub changeStatus
+{
+        my $queueObj = shift;
+        my $status   = shift;
+        my $idList   = shift;
+
+        my $count = $#{ $idList } + 1;
+
+        if ($count <= 0)
+        {
+                LOG("Nothing to update");
+
+                return 0;
+        }
+
+        $queueObj->ping();
+
+        my $in = join(',', @{ $idList });
+
+        my $query = "UPDATE director_queue_tbl SET status = ? WHERE director_queue_id IN ($in)";
+
+        $queueObj->execute($query, $status);
+
+        if ($queueObj->{'error_flag'})
+        {
+                my $msg = $queueObj->{'error_text'};
+
+                LOG("Unable to update status: $msg");
+
+                return -1;
+        }
+
+        return 0;
+}
+
+sub processQueues
+{
+        my $customerId = shift;
+        my $sensorId   = shift;
+        my $queues     = shift;
+
+        my $childPid = fork();
+
+        if (defined($childPid) == 0)
+        {
+                LOG("Unable to create child process: $!");
+
+                return -1;
+        }
+
+        if ($childPid)
+        {
+                $childCount++;
+
+                return $childPid;
+        }
+
+        $isChild = 1;
+
+        #
+        # This is the child.
+        #
+
+        redirectOutput($sensorId);
+
+        #
+        # Initialise the database handles.
+        #
+
+        my $dataObj     = AlertLogic::Base::Database->new(\%dataConfig);
+        my $payloadObj  = AlertLogic::Base::Database->new(\%payloadConfig);
+        my $queueObj    = AlertLogic::Base::Database->new(\%queueConfig);
+        my $proxyObj    = AlertLogic::Base::Database->new(\%proxyConfig);
+        
+        $dataObj->{'han'}->{'InactiveDestroy'} = 1;
+        $queueObj->{'han'}->{'InactiveDestroy'} = 1;
+
+        LOG("Customer ID:    $customerId");
+
+        #
+        # Read the database of event types that should not be processed.
+        #
+
+        my $skipConfig = skipConfig("/var/alertlogic/etc/skip.conf");
+
+        #
+        # Process each packet in the batch.
+        #
+
+        my $lastEventTime = 0;
+        my $lastEventId   = 0;
+        my $eventCount    = 0;
+
+        my $query;
+
+        foreach my $queueId (@{ $queues })
+        {
+                LOG('-' x 60);
+
+                LOG("- Processing queue $queueId for sensor $sensorId");
+
+                #
+                # Before processing each queue in the array, set the
+                # status to '5'.
+                #
+
+                my @idList = ( $queueId );
+
+                if (changeStatus($queueObj, 5, \@idList) < 0)
+                {
+                        LOG("Unable to change queue status");
+
+                        next;
+                }
+
+                #
+                # Get the binary data from the 'director_batch_tbl' table.
+                #
+
+                my ( $binaryData, $batchVersion, $batchId ) =
+                    getBatch($queueObj, $queueId);
+
+                if (defined($binaryData) == 0)
+                {
+                        next;
+                }
+
+                my $binaryLen = length $binaryData;
+
+                #
+                # Break the batch into its individual events.
+                #
+
+                my $maxLen = ($batchVersion == 6) ? 84 : 97;
+                my $eventNum = 0;
+
+                while ($binaryLen >= $maxLen)
+                {
+                        my $obj;
+                        if ($batchVersion == 4)
+                        {
+                            $obj = parseOldEvent($binaryData);
+                        }
+                        elsif ($batchVersion == 6)
+                        {
+                            $obj = parseEvent($binaryData);
+                        }
+                        elsif ($batchVersion == 8)
+                        {
+                            $obj = parseEventAndPacketData($binaryData);
+                        }
+
+                        $obj->{'customer_id'} = $customerId;
+                        $obj->{'sensor_id'}   = $sensorId;
+                        $obj->{'batch_id'}    = $batchId;
+                        $obj->{'event_num'}   = $eventNum++;
+                        
+                        $binaryData = $obj->{'next'};
+                        $binaryLen  = length $binaryData;
+                        
+                        #
+                        # Do we want to skip this event?
+                        #
+
+                        my $skipEvent = skipMatch($skipConfig, $sensorId, $obj);
+
+                        if (($skipEvent == 1) || ($obj->{'ip_p'} == 0))
+                        {
+                                LOG("[ Not inserting event ]");
+
+                                next;
+                        }
+
+                        #
+                        # If this is a rollup event update, find the parent and
+                        # increment the event count.
+                        #
+
+                        LOG("Snort Event ID: " . $obj->{'event_id'});
+                        LOG("Snort PID:      " . $obj->{'snort_pid'});
+                        LOG("Update Event:   " . $obj->{'event_update'});
+
+                        if ($obj->{'event_update'} > 0)
+                        {
+                                my $eventId  = findParentEvent($dataObj, $obj);
+                                my $parentId = $obj->{'event_update'};
+
+                                if ($eventId == 0)
+                                {
+                                        LOG("Unable to find parent event $parentId");
+
+                                        next;
+                                }
+
+                                LOG("Parent Event:   $eventId");
+
+                                my $count = $obj->{'event_count'};
+                                my $now   = $obj->{'snort_ts_sec'};
+
+                                $query = "
+                                        UPDATE
+                                                ${customerId}_event_tbl
+                                        SET
+                                                repeat_count = repeat_count + ?,
+                                                create_date = ?
+                                        WHERE
+                                                event_id = ?";
+
+                                $dataObj->execute($query, $count, $now, $eventId);
+
+                                if ($dataObj->{'error_flag'})
+                                {
+                                        my $msg = $dataObj->{'error_text'};
+
+                                        LOG("Unable to update count for $eventId: $msg");
+
+                                        next;
+                                }
+
+                                $query = "
+                                        UPDATE
+                                                ${customerId}_fast_event_tbl
+                                        SET
+                                                repeat_count = repeat_count + ?,
+                                                create_date = ?
+                                        WHERE
+                                                event_id = ?";
+
+                                $dataObj->execute($query, $count, $now, $eventId);
+
+                                if ($dataObj->{'error_flag'})
+                                {
+                                        my $msg = $dataObj->{'error_text'};
+
+                                        LOG("Unable to update count for fast event $eventId" .
+                                                $msg);
+
+                                        next;
+                                }
+
+                                next;
+                        }
+
+                        #
+                        # Attempt to link response events to their attack event.
+                        #
+
+                        if ($obj->{'response'} == 0)
+                        {
+                                my $pid     = $obj->{'snort_pid'};
+                                my $snortId = $obj->{'event_id'};
+
+                                #
+                                # We use the "special" column in event_tbl to link
+                                # response events to their attack events.
+                                # Since this is an attack, insert Snort's PID and
+                                # the ID of this event in the "special" column.
+                                #
+
+                                $obj->{'column'}   = 'special';
+                                $obj->{'special'}  = "$pid.$snortId";
+                                $obj->{'severity'} = 0;
+
+                                LOG("Special:        " . $obj->{'special'});
+                        }
+                        else
+                        {
+                                my $pid      = $obj->{'snort_pid'};
+                                my $parentId = $obj->{'event_reference'};
+
+                                #
+                                # This is a response event.  Look for events in the
+                                # "special" column that contain our current PID and
+                                # reference (parent) ID.
+                                #
+
+                                my $special    = "$pid.$parentId";
+                                $obj->{'column'} = 'linked_attack';
+
+                                $query = "
+                                        SELECT
+                                                event_id,
+                                                severity
+                                        FROM
+                                                ${customerId}_event_tbl
+                                        WHERE
+                                                sensor_id = ? AND
+                                                special = ?
+                                        ORDER BY
+                                                event_id DESC
+                                        LIMIT
+                                                1";
+
+                                my $results = $dataObj->execute($query, $sensorId, $special);
+
+                                $obj->{'special'}  = $results->[0]->{'event_id'} || 0;
+                                $obj->{'severity'} = $results->[0]->{'severity'} || 0;
+
+                                if ($obj->{'special'} == 0)
+                                {
+                                        LOG("Cannot find attack event $special");
+
+                                        next;
+                                }
+                            }
+
+                        #
+                        # Format the snort timestamp.
+                        #
+
+                        my @snortDate = localtime($obj->{'snort_ts_sec'});
+
+                        my $snortYear = $snortDate[5] + 1900;
+                        my $snortMon  = $snortDate[4] + 1;
+                        my $snortDay  = $snortDate[3];
+                        my $snortHour = $snortDate[2];
+                        my $snortMin  = $snortDate[1];
+                        my $snortSec  = $snortDate[0];
+                        my $snortMSec = $obj->{'snort_ts_usec'};
+
+                        $obj->{'snort_time'} = sprintf("%02d-%02d-%02d %02d:%02d:%02d.%02d",
+                                $snortYear, $snortMon, $snortDay,
+                                $snortHour, $snortMin, $snortSec, $snortMSec);
+
+                        $obj->{'al_ts_sec'} = $obj->{'snort_ts_sec'};
+
+                        #
+                        # Set the event indicator type.
+                        #
+                        # By default, everything is currently set to 'snort'.
+                        #
+
+                        $obj->{'indicator'}  = 10 * 10000000;   # sig-based IDS event
+                        $obj->{'indicator'} += 00 * 100000;     # snort
+
+                        #
+                        # If this is a snort preprocessor event, the signature
+                        # ID should be "p<generator ID>.<signature ID>".
+                        #
+
+                        my $generatorId = $obj->{'generator_id'};
+                        my $signatureId = $obj->{'signature_id'};
+
+                        LOG("Generator ID:   $generatorId");
+
+                        if (($generatorId == 1) || ($generatorId == 2))
+                        {
+                                #
+                                # Set the indicator type to 'normal'.
+                                #
+
+                                $obj->{'indicator'} += 00 * 1000;
+                                $obj->{'indicator'} += 01 if ($generatorId == 2);
+                        }
+                        else
+                        {
+                                $obj->{'signature_id'} = "p${generatorId}.${signatureId}";
+
+                                #
+                                # Set the indicator type to 'preprocessor'.
+                                #
+
+                                $obj->{'indicator'} += 01 * 1000;
+                                $obj->{'indicator'} += 01 if ($generatorId == 111);
+                        }
+
+                        LOG("Signature ID:   " . $obj->{'signature_id'});
+
+                        if ($generatorId > 3)
+                        {
+                                my @preprocessors  = (
+                                         '003',  '004',  '031',  '048',  '083',  '112',  '182',
+                                         '197',  '208',  '228',  '229',  '230',  '234',  '235',
+                                         '236',  '237',  '238',  '239',  '240',  '241',  '242',
+                                         '243',  '246',  '247',  '251',  '253',  '254',  '255',
+                                         '256',  '257',  '259',  '260',  '261',  '262',  '264',
+                                         '279',  '280',  '281',  '282',  '287',  '297',  '303',
+                                         '314',  '315',  '322',  '324',  '635',  '220',  '550',
+                                        '1608', '1936', '2166', '2167',  '3473', '3767', '3779',
+                                        '3785', '4286', '4305', '4315');
+
+                                if (scalar grep(/^$sensorId$/, @preprocessors) == 0)
+                                {
+                                        LOG("Ignoring preprocessor events from this sensor");
+
+                                        next;
+                                }
+                        }
+
+                        #
+                        # Insert the data into the database.
+                        #
+
+                        my @databases = ( $dataObj, $payloadObj, $proxyObj, $queueObj );
+                        my $severity = 0;
+                        my $ssdl_class = 0;
+
+                        ($lastEventId, $signatureId, $severity, $ssdl_class) = insertEvent(@databases, $obj);
+
+                        if ($lastEventId <= 0)
+                        {
+                                LOG("Error inserting event");
+
+                                next;
+                        }
+
+                        #
+                        # If the SSDL class < 3 then it is not an informative event and we should
+                        # try to send an alert for it
+                        #
+                        if ($ssdl_class < 3) 
+                        {
+                            my $socket = IO::Socket::UNIX->new(
+                                Type => SOCK_STREAM,
+                                Peer => $sockpath,
+                            );
+
+                            if ( ! $socket ) 
+                            {
+                                LOG("- WARNING: no event alert service socket found; no alert for $lastEventId can be sent to customer $customerId");
+                            }
+                            else 
+                            {
+                                my $t0 = [gettimeofday()];
+                                sendAlert($socket, $customerId, $lastEventId, $signatureId, $severity);
+                                my $elapsed = tv_interval($t0);
+                                LOG("- sendAlert elapsed time: $elapsed");
+                            }
+                        }
+
+                        $eventCount++;
+                }
+
+                if (changeStatus($queueObj, 1, \@idList) < 0)
+                {
+                    LOG("Unable to change queue status");
+
+                    next;
+                }
+
+                LOG("- Completed processing of queue $queueId");
+        }
+
+        if (($eventCount > 0) && ($lastEventId > 0))
+        {
+                $query = "
+                        UPDATE
+                                sensor_tbl
+                        SET
+                                last_event_time = ?,
+                                last_event_id = ?
+                        WHERE
+                                sensor_id = ?";
+
+                $dataObj->execute($query,  $lastEventTime, $lastEventId, $sensorId);
+
+                if ($dataObj->{'error_flag'})
+                {
+                        my $msg = $dataObj->{'error_text'};
+
+                        LOG("Unable to update sensor statistics: $msg");
+                }
+        }
+
+        $dataObj->close();
+        $queueObj->close();
+
+        open STDOUT, '>&OLDSTDOUT';
+        open STDERR, '>&OLDSTDERR';
+
+        exit(0);
+}
+
+#
+# Parse an event from the old client.
+#
+
+sub parseOldEvent
+{
+        my $data = shift;
+
+        my $structure = 'NNNNCnNNnNNNnNnnnCnnnCCnLLnnnCCNNnCnnna*';
+        my @values = unpack($structure, $data);
+
+        my %out;
+
+        setPacketDefaults(\%out);
+
+        $out{'generator_id'}    = shift @values;
+        $out{'signature_id'}    = shift @values;
+        $out{'snort_ts_sec'}    = shift @values;
+        $out{'snort_ts_usec'}   = shift @values;
+        $out{'response'}        = shift @values;
+        $out{'snort_pid'}       = shift @values;
+        $out{'event_id'}        = shift @values;
+        $out{'event_reference'} = shift @values;
+        $out{'caplen'}          = shift @values;
+        $out{'event_count'}     = shift @values;
+        $out{'event_update'}    = shift @values;
+
+        #
+        # Ethernet options.
+        #
+
+        $out{'shost_major'} = shift @values;
+        $out{'shost_minor'} = shift @values;
+        $out{'dhost_major'} = shift @values;
+        $out{'dhost_minor'} = shift @values;
+
+        #
+        # IP specific options.
+        #
+
+        $out{'ip_v'}   = shift @values;
+        $out{'ip_hl'}  = shift @values;
+        $out{'ip_tos'} = shift @values;
+        $out{'ip_len'} = shift @values;
+        $out{'ip_id'}  = shift @values;
+        $out{'ip_off'} = shift @values;
+        $out{'ip_ttl'} = shift @values;
+        $out{'ip_p'}   = shift @values;
+        $out{'ip_sum'} = shift @values;
+
+        my $ipSrc = shift @values; $out{'ip_src'} = pack('N', $ipSrc);
+        my $ipDst = shift @values; $out{'ip_dst'} = pack('N', $ipDst);
+
+        $out{'ip_src_str'} = inet_ntop(AF_INET, $out{'ip_src'});
+        $out{'ip_dst_str'} = inet_ntop(AF_INET, $out{'ip_dst'});
+
+        if ($out{'ip_p'} == 1) {
+
+                #
+                # ICMP
+                #
+
+                for (1 .. 2) { my $tmp = shift @values; }
+
+                $out{'icmp_csum'} = shift @values;
+                $out{'icmp_type'} = shift @values;
+                $out{'icmp_code'} = shift @values;
+
+                for (1 .. 6) { my $tmp = shift @values; }
+                for (1 .. 1) { my $tmp = shift @values; }
+
+        } elsif ($out{'ip_p'} == 6) {
+
+                #
+                # TCP
+                #
+
+                $out{'tcp_sport'} = shift @values;
+                $out{'tcp_dport'} = shift @values;
+                $out{'tcp_sum'}   = shift @values;
+
+                for (1 .. 2) { my $tmp = shift @values; }
+
+                $out{'tcp_seq'}    = shift @values;
+                $out{'tcp_ack'}    = shift @values;
+                $out{'tcp_off'}    = shift @values;
+                $out{'tcp_flags'}  = shift @values;
+                $out{'tcp_win'}    = shift @values;
+                $out{'tcp_urp'}    = shift @values;
+
+                $out{'tcp_res'}    = ($out{'tcp_off'} & 0x0f);
+                $out{'tcp_off'}    = (($out{'tcp_off'} & 0xf0) >> 4);
+
+                for (1 .. 1) { my $tmp = shift @values; }
+
+        } elsif ($out{'ip_p'} == 17) {
+
+                #
+                # UDP
+                #
+
+                my $tmp;
+
+                $out{'udp_sport'} = shift @values;
+                $out{'udp_dport'} = shift @values;
+                $out{'udp_sum'}   = shift @values;
+
+                for (1 .. 2) { my $tmp = shift @values; }
+                for (1 .. 6) { my $tmp = shift @values; }
+
+                $out{'udp_len'}   = shift @values;
+
+        } else {
+
+                #
+                # Unknown protocol.
+                #
+
+                for (1 .. 3) { my $tmp = shift @values; }
+                for (1 .. 2) { my $tmp = shift @values; }
+                for (1 .. 6) { my $tmp = shift @values; }
+                for (1 .. 1) { my $tmp = shift @values; }
+        }
+
+        #
+        # Everything remaining at the tail of the buffer.
+        #
+
+        $data = shift @values;
+
+        #
+        # Payload.
+        #
+
+        my $btr = $out{'caplen'};
+
+        @values = unpack("a${btr}a*", $data);
+
+        $out{'payload'} = shift @values;
+        $out{'next'}    = shift @values;
+
+        return \%out;
+}
+
+#
+# Parse a raw event.
+#
+
+sub parseEvent
+{
+        my $data = shift;
+
+        my $structure = 'LSCCLLLLLLLLLLLLLLLLLLa*';
+        my @values    = unpack($structure, $data);
+
+        my %out;
+
+        $out{'link_type'}          = shift @values;
+        $out{'snort_pid'}          = shift @values;
+        $out{'xff'}                = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+
+        $out{'generator_id'}       = shift @values;
+        $out{'signature_id'}       = shift @values;
+        $out{'signature_revision'} = shift @values;
+        $out{'signature_class'}    = shift @values;
+        $out{'priority'}           = shift @values;
+        $out{'event_id'}           = shift @values;
+        $out{'event_reference'}    = shift @values;
+        $out{'snort_ts_sec'}       = shift @values;
+        $out{'snort_ts_usec'}      = shift @values;
+        $out{'snort_flags'}        = shift @values;
+        $out{'pcap_ts_sec'}        = shift @values;
+        $out{'pcap_ts_usec'}       = shift @values;
+        $out{'caplen'}             = shift @values;
+        $out{'pktlen'}             = shift @values;
+
+        $out{'response'}     = 0;
+        $out{'event_update'} = 0;
+        $out{'event_count'}  = 1;
+
+        if ($out{'event_id'} != $out{'event_reference'})
+        {
+                $out{'response'} = 1;
+        }
+
+        my $remaining = shift @values;
+        my $length = $out{'caplen'};
+
+        my $packet;
+        my $next;
+
+        ( $packet, $next ) = unpack("a${length}a*", $remaining);
+
+        if ($out{'xff'} > 0)
+        {
+                if ($out{'xff'} & TCI_IPV4)
+                {
+                        my @xff = unpack('NNa*', $next);
+
+                        my $clientAddr = shift @xff;
+                        my $proxyAddr  = shift @xff;
+
+                        $out{'client_addr'} = $clientAddr;
+                        $out{'proxy_addr'}  = $proxyAddr;
+
+                        $out{'client_addr_str'} = inet_ntop(AF_INET, pack('N', $clientAddr));
+                        $out{'proxy_addr_str'}  = inet_ntop(AF_INET, pack('N', $proxyAddr));
+
+                        $next = shift @xff;
+                }
+
+                if ($out{'xff'} & TCI_IPV6)
+                {
+                        my @xff = unpack('a16a16a*', $next);
+
+                        my $clientAddr = shift @xff;
+                        my $proxyAddr  = shift @xff;
+
+                        $out{'client_addr'} = $clientAddr;
+                        $out{'proxy_addr'}  = $proxyAddr;
+
+                        $out{'client_addr_str'} = inet_ntop(AF_INET6, $clientAddr);
+                        $out{'proxy_addr_str'}  = inet_ntop(AF_INET6, $proxyAddr);
+
+                        $next = shift @xff;
+                }
+        }
+
+        $out{'packet'} = $packet;
+        $out{'next'}   = $next;
+
+        parsePacket($packet, \%out);
+
+        return \%out;
+}
+
+sub parsePacket
+{
+        my $packet = shift;
+        my $obj    = shift;
+
+        setPacketDefaults($obj);
+
+        my $linkType  = $obj->{'link_type'};
+        my $etherType = 0;
+
+        #
+        # Link header
+        #
+
+        if ($linkType == LT_ETHERNET)
+        {
+                my $format = 'NnNnna*';
+
+                my @eth = unpack($format, $packet);
+
+                my $dhostMajor = shift @eth;
+                my $dhostMinor = shift @eth;
+                my $shostMajor = shift @eth;
+                my $shostMinor = shift @eth;
+
+                $etherType = shift @eth;
+                $packet    = shift @eth;
+        }
+        else
+        {
+                LOG("Unknown link type: $linkType");
+        }
+
+        #
+        # 802.1q (VLAN) header
+        #
+
+        if ($etherType == ETHERTYPE_8021Q)
+        {
+                my $format = 'nna*';
+
+                my @vlan = unpack($format, $packet);
+
+                my $vlanInfo = shift @vlan;
+
+                $etherType = shift @vlan;
+                $packet    = shift @vlan;
+        }
+
+        #
+        # IP header
+        #
+
+        my $nextHeader = 0;
+
+        if ($etherType == ETHERTYPE_IP)
+        {
+                my $format = 'CCnnnCCnNNa*';
+
+                my @ip = unpack($format, $packet);
+
+                my $ipVhl = shift @ip;
+                my $ipVer = 4;
+                my $ipHl  = 20;
+                my $ipTos = shift @ip; $obj->{'ip_tos'} = $ipTos;
+                my $ipLen = shift @ip; $obj->{'ip_len'} = $ipLen;
+                my $ipId  = shift @ip; $obj->{'ip_id'}  = $ipId;
+                my $ipFlg = 0;
+                my $ipOff = shift @ip;
+                my $ipTtl = shift @ip; $obj->{'ip_ttl'} = $ipTtl;
+                my $ipP   = shift @ip; $obj->{'ip_p'}   = $ipP;
+                my $ipSum = shift @ip; $obj->{'ip_sum'} = $ipSum;
+                my $ipSrc = shift @ip; $obj->{'ip_src'} = pack('N', $ipSrc);
+                my $ipDst = shift @ip; $obj->{'ip_dst'} = pack('N', $ipDst);
+
+                if (defined($obj->{'proxy_addr'}) == 1)
+                {
+                        if ($ipSrc eq $obj->{'proxy_addr'})
+                        {
+                                $ipSrc = $obj->{'client_addr'};
+
+                                $obj->{'ip_src'} = pack('N', $ipSrc);
+                        }
+
+                        if ($ipDst eq $obj->{'proxy_addr'})
+                        {
+                                $ipDst = $obj->{'client_addr'};
+
+                                $obj->{'ip_dst'} = pack('N', $ipDst);
+                        }
+                }
+
+                $ipVer = (($ipVhl & 0xf0) >> 4);
+                $ipHl  = ($ipVhl & 0x0f);
+                $ipFlg = (($ipOff & 0xe000) >> 13);
+                $ipOff = ($ipOff & 0x1fff);
+
+                $obj->{'ip_v'}     = $ipVer;
+                $obj->{'ip_hl'}    = $ipHl;
+                $obj->{'ip_flags'} = $ipFlg;
+                $obj->{'ip_off'}   = $ipOff;
+
+                $obj->{'ip_src_str'} = inet_ntop(AF_INET, pack('N', $ipSrc));
+                $obj->{'ip_dst_str'} = inet_ntop(AF_INET, pack('N', $ipDst));
+
+                $packet = shift @ip;
+
+                $nextHeader = $ipP;
+        }
+        elsif ($etherType == ETHERTYPE_IPV6)
+        {
+                my $format = 'NnCCa16a16a*';
+
+                my @ip6 = unpack($format, $packet);
+
+                my $ipVer = shift @ip6;
+                my $ipLen = shift @ip6; $obj->{'ip_len'} = $ipLen;
+                my $ipNxt = shift @ip6;
+                my $ipHop = shift @ip6;
+                my $ipSrc = shift @ip6; $obj->{'ip_src'} = $ipSrc;
+                my $ipDst = shift @ip6; $obj->{'ip_dst'} = $ipDst;
+
+                if (defined($obj->{'proxy_addr'}) == 1)
+                {
+                        if ($ipSrc eq $obj->{'proxy_addr'})
+                        {
+                                $ipSrc = $obj->{'client_addr'};
+
+                                $obj->{'ip_src'} = $ipSrc;
+                        }
+
+                        if ($ipDst eq $obj->{'proxy_addr'})
+                        {
+                                $ipDst = $obj->{'client_addr'};
+
+                                $obj->{'ip_dst'} = $ipDst;
+                        }
+                }
+
+                $ipVer = (($ipVer & 0xf0000000) >> 28);
+
+                $obj->{'ip_v'}  = $ipVer;
+                $obj->{'ip_hl'} = 40;
+
+                $obj->{'ip_src_str'} = inet_ntop(AF_INET6, $ipSrc);
+                $obj->{'ip_dst_str'} = inet_ntop(AF_INET6, $ipDst);
+
+                $packet = shift @ip6;
+
+                $nextHeader = $ipNxt;
+        }
+        else
+        {
+                LOG("Unknown ethertype $etherType");
+
+                $nextHeader = 0;
+        }
+
+        while ($nextHeader > 0)
+        {
+                $obj->{'ip_p'} = $nextHeader;
+
+                if ($nextHeader == IPPROTO_HOPOPTS)
+                {
+                        my $format = 'CCa6a*';
+
+                        my @hop = unpack($format, $packet);
+
+                        my $nxt = shift @hop;
+                        my $len = shift @hop;
+                        my $opt = shift @hop;
+
+                        $packet = shift @hop;
+
+                        #
+                        # The length specifies, in multiples of 8 bytes,
+                        # additional hop options in the header.
+                        #
+
+                        if ($len > 0)
+                        {
+                                $len = $len * 8;
+
+                                $format = "a${len}a*";
+
+                                my @options = unpack($format, $packet);
+                                my $options = shift @options;
+
+                                $packet = shift @options;
+                        }
+
+                        $nextHeader = $nxt;
+                }
+                elsif ($nextHeader == IPPROTO_DSTOPTS)
+                {
+                        my $format = 'CCa6a*';
+
+                        my @dst = unpack($format, $packet);
+
+                        my $nxt = shift @dst;
+                        my $len = shift @dst;
+                        my $opt = shift @dst;
+
+                        $packet = shift @dst;
+
+                        #
+                        # The length specifies, in multiples of 8 bytes,
+                        # additional destination options in the header.
+                        #
+
+                        if ($len > 0)
+                        {
+                                $len = $len * 8;
+
+                                $format = "a${len}a*";
+
+                                my @options = unpack($format, $packet);
+                                my $options = shift @options;
+
+                                $packet = shift @options;
+                        }
+
+                        $nextHeader = $nxt;
+                }
+                elsif ($nextHeader == IPPROTO_ROUTING)
+                {
+                        my $format = 'CCCCa4a*';
+
+                        my @rt = unpack($format, $packet);
+
+                        my $nxt  = shift @rt;
+                        my $len  = shift @rt;
+                        my $type = shift @rt;
+                        my $seg  = shift @rt;
+                        my $data = shift @rt;
+
+                        $packet = shift @rt;
+
+                        if ($len > 0)
+                        {
+                                $len = $len * 8;
+
+                                $format = "a${len}a*";
+
+                                my @options = unpack($format, $packet);
+                                my $options = shift @options;
+
+                                $packet = shift @options;
+                        }
+
+                        $nextHeader = $nxt;
+                }
+                elsif ($nextHeader == IPPROTO_FRAGMENT)
+                {
+                        my $format = 'CCnNa*';
+
+                        my @frag = unpack($format, $packet);
+
+                        my $nxt = shift @frag;
+                        my $res = shift @frag;
+                        my $off = shift @frag;
+                        my $id  = shift @frag;
+
+                        $packet = shift @frag;
+
+                        $nextHeader = $nxt;
+                }
+                elsif (($nextHeader == IPPROTO_ICMP) || ($nextHeader == IPPROTO_ICMPV6))
+                {
+                        my $format = 'CCna*';
+
+                        my @icmp = unpack($format, $packet);
+
+                        my $icmpType = shift @icmp; $obj->{'icmp_type'} = $icmpType;
+                        my $icmpCode = shift @icmp; $obj->{'icmp_code'} = $icmpCode;
+                        my $icmpSum  = shift @icmp; $obj->{'icmp_csum'} = $icmpSum;
+
+                        $packet = shift @icmp;
+
+                        $nextHeader = 0;
+                }
+                elsif ($nextHeader == IPPROTO_TCP)
+                {
+                        my $format = 'nnNNCCnnna*';
+
+                        my @tcp = unpack($format, $packet);
+
+                        my $tcpSrc = shift @tcp; $obj->{'tcp_sport'} = $tcpSrc;
+                        my $tcpDst = shift @tcp; $obj->{'tcp_dport'} = $tcpDst;
+                        my $tcpSeq = shift @tcp; $obj->{'tcp_seq'}   = $tcpSeq;
+                        my $tcpAck = shift @tcp; $obj->{'tcp_ack'}   = $tcpAck;
+                        my $tcpOff = shift @tcp;
+                        my $tcpFlg = shift @tcp; $obj->{'tcp_flags'} = $tcpFlg;
+                        my $tcpWin = shift @tcp; $obj->{'tcp_win'}   = $tcpWin;
+                        my $tcpSum = shift @tcp; $obj->{'tcp_sum'}   = $tcpSum;
+                        my $tcpUrp = shift @tcp; $obj->{'tcp_urp'}   = $tcpUrp;
+
+                        my $tcpRes = 0;
+
+                        $tcpRes = ($tcpOff & 0x0f);
+                        $tcpOff = (($tcpOff & 0xf0) >> 4);
+
+                        $obj->{'tcp_off'} = $tcpOff;
+                        $obj->{'tcp_res'} = $tcpRes;
+
+                        $packet = shift @tcp;
+
+                        $nextHeader = 0;
+                }
+                elsif ($nextHeader == IPPROTO_UDP)
+                {
+                        my $format = 'nnnna*';
+
+                        my @udp = unpack($format, $packet);
+
+                        my $udpSrc = shift @udp; $obj->{'udp_sport'} = $udpSrc;
+                        my $udpDst = shift @udp; $obj->{'udp_dport'} = $udpDst;
+                        my $udpLen = shift @udp; $obj->{'udp_len'}   = $udpLen;
+                        my $udpSum = shift @udp; $obj->{'udp_sum'}   = $udpSum;
+
+                        $packet = shift @udp;
+
+                        $nextHeader = 0;
+                }
+                else
+                {
+                        LOG("Unknown protocol $nextHeader");
+
+                        last;
+                }
+        }
+
+        $obj->{'payload'} = $packet;
+
+        return;
+}
+
+#
+# Parse an event that includes parsed packet information
+#
+
+sub parseEventAndPacketData
+{
+        my $data = shift;
+
+        my $structure = 'LSCCCSCLLLLLLLLLLLLLLLLLLa*';
+        my @values    = unpack($structure, $data);
+
+        my %out;
+
+        # Alertlogic Header
+        $out{'link_type'}          = shift @values;
+        $out{'snort_pid'}          = shift @values;
+        $out{'xff'}                = shift @values;
+        $out{'gre_layers'}         = shift @values;
+        $out{'vlan_layers'}        = shift @values;
+        $out{'payload_offset'}     = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+        $out{'unused'}             = shift @values;
+
+        # Snort Event header
+        $out{'generator_id'}       = shift @values;
+        $out{'signature_id'}       = shift @values;
+        $out{'signature_revision'} = shift @values;
+        $out{'signature_class'}    = shift @values;
+        $out{'priority'}           = shift @values;
+        $out{'event_id'}           = shift @values;
+        $out{'event_reference'}    = shift @values;
+        $out{'snort_flags'}        = shift @values;
+        $out{'snort_ts_sec'}       = shift @values;
+        $out{'snort_ts_usec'}      = shift @values;
+
+        $out{'pcap_ts_sec'}        = shift @values;
+        $out{'pcap_ts_usec'}       = shift @values;
+        $out{'caplen'}             = shift @values;
+        $out{'pktlen'}             = shift @values;
+
+        # Pcap header
+        $out{'response'}     = 0;
+        $out{'event_update'} = 0;
+        $out{'event_count'}  = 1;
+
+        if ($out{'event_id'} != $out{'event_reference'})
+        {
+                $out{'response'} = 1;
+        }
+
+        my $remaining = shift @values;
+        my $length = $out{'caplen'};
+
+        # Parsed packet information.
+        my $packet;
+        my $payloadOffset = $out{'payload_offset'};
+        my $packetHeaders;
+        my $packetPayload;
+        my $ipFamily;
+        my $ip_protocol;
+
+        # Init packet data
+        setPacketDefaults(\%out);
+
+        # Get packet and payload.
+        ( $packet, $remaining ) = unpack("a${length}a*", $remaining);
+        ( $packetHeaders, $packetPayload ) = unpack("a${payloadOffset}a*", $packet);
+        $out{'packet'} = $packet;
+        $out{'payload'} = $packetPayload;
+
+        # VLAN information (if any).
+        if ($out{'vlan_layers'} > 0) 
+        {
+            my @vlan_layers;
+            for (my $idx = 0; $idx < $out{'vlan_layers'}; $idx++) 
+            {
+                my $vlan_priority;
+                my $vlan_cfi, 
+                my $vlan_id;
+                my $vlan_etype;
+                ( $vlan_priority, $vlan_cfi, $vlan_id, $vlan_etype, $remaining ) = 
+                    unpack("nnnna*", $remaining);
+                push @vlan_layers, { 'priority' => $vlan_priority, 
+                                     'cfi'      => $vlan_cfi, 
+                                     'id'       => $vlan_id, 
+                                     'etype'    => $vlan_etype };
+            }
+            $out{'vlan_data'} = \@vlan_layers;
+        }
+
+        # IPv4 information
+        # XFF information has been already applied.
+        ( $ipFamily, $remaining ) = unpack("Ca*", $remaining);
+        if ($ipFamily == AF_INET) 
+        {
+            my @ip = unpack('CCCnnCnCCnNNa*', $remaining);
+
+            my $ipVer = shift @ip; $out{'ip_v'}     = $ipVer;
+            my $ipHl  = shift @ip; $out{'ip_hl'}    = $ipHl;
+            my $ipTos = shift @ip; $out{'ip_tos'}   = $ipTos;
+            my $ipLen = shift @ip; $out{'ip_len'}   = $ipLen;
+            my $ipId  = shift @ip; $out{'ip_id'}    = $ipId;
+            my $ipFlg = shift @ip; $out{'ip_flags'} = $ipFlg;
+            my $ipOff = shift @ip; $out{'ip_off'}   = $ipOff;
+            my $ipTtl = shift @ip; $out{'ip_ttl'}   = $ipTtl;
+            my $ipP   = shift @ip; 
+            my $ipSum = shift @ip; $out{'ip_sum'}   = $ipSum;
+            my $ipSrc = shift @ip; $out{'ip_src'}   = pack('N', $ipSrc);
+            my $ipDst = shift @ip; $out{'ip_dst'}   = pack('N', $ipDst);
+
+            $out{'ip_src_str'} = inet_ntop(AF_INET, pack('N', $ipSrc));
+            $out{'ip_dst_str'} = inet_ntop(AF_INET, pack('N', $ipDst));
+
+            $remaining = shift @ip;
+            
+        } 
+        elsif ($ipFamily == AF_INET6) 
+        {
+            my @ipv6 = unpack('CnCCCa16a16a*', $remaining);
+            
+            my $ipVer  = shift @ipv6; $out{'ip_v'}   = $ipVer;
+            my $ipLen  = shift @ipv6; $out{'ip_len'} = $ipLen;
+            my $ipHl   = shift @ipv6; $out{'ip_hl'}  = $ipHl;
+            my $ipNxt  = shift @ipv6;
+            my $ipHlim = shift @ipv6; $out{'ip_ttl'} = $ipHlim;
+            my $ipSrc  = shift @ipv6; $out{'ip_src'} = $ipSrc;
+            my $ipDst  = shift @ipv6; $out{'ip_dst'} = $ipDst;
+
+            $out{'ip_src_str'} = inet_ntop(AF_INET6, $ipSrc);
+            $out{'ip_dst_str'} = inet_ntop(AF_INET6, $ipDst);
+            
+            $remaining = shift @ipv6;
+        }
+        
+        # GRE information
+        if ($out{'gre_layers'} > 0)
+        {
+            my @gre_layers;
+            for (my $idx = 0; $idx < $out{'gre_layers'}; $idx++) 
+            {
+                my $greSrcAddr;
+                my $greDstAddr;
+                ( $ipFamily, $remaining ) = unpack('Ca*', $remaining);
+                if ($ipFamily == AF_INET)
+                {
+                    ( $greSrcAddr, $greDstAddr, $remaining ) = 
+                        unpack('a4a4a*', $remaining);
+                } elsif ($ipFamily == AF_INET6) {
+                    ( $greSrcAddr, $greDstAddr, $remaining ) = 
+                        unpack('a16a16a*', $remaining);
+                } else {
+                    LOG("Error: Unsupported network family for GRE: " . $ipFamily);
+                    LOG("Skipping ...");
+                    return \%out;
+                }
+                push @gre_layers, { 'ip_src_str' => inet_ntop($ipFamily, $greSrcAddr), 
+                                    'ip_dst_str' => inet_ntop($ipFamily, $greDstAddr) };
+            }
+            $out{'gre_data'} = \@gre_layers;
+        }
+
+        # Upper layer protocols
+        ( $ip_protocol, $remaining ) = unpack('Ca*', $remaining);
+        $out{'ip_p'} = $ip_protocol;
+        if ($ip_protocol == IPPROTO_TCP) 
+        {
+            my @tcp = unpack('nnNNCCnnnna*', $remaining);
+
+            my $tcpSrc = shift @tcp; $out{'tcp_sport'} = $tcpSrc;
+            my $tcpDst = shift @tcp; $out{'tcp_dport'} = $tcpDst;
+            my $tcpSeq = shift @tcp; $out{'tcp_seq'}   = $tcpSeq;
+            my $tcpAck = shift @tcp; $out{'tcp_ack'}   = $tcpAck;
+            my $tcpOff = shift @tcp; $out{'tcp_off'}   = $tcpOff;
+            my $tcpRes = shift @tcp; $out{'tcp_res'}   = $tcpRes;
+            my $tcpFlg = shift @tcp; $out{'tcp_flags'} = $tcpFlg;
+            my $tcpWin = shift @tcp; $out{'tcp_win'}   = $tcpWin;
+            my $tcpSum = shift @tcp; $out{'tcp_sum'}   = $tcpSum;
+            my $tcpUrp = shift @tcp; $out{'tcp_urp'}   = $tcpUrp;
+
+            $remaining = shift @tcp;
+        }
+        elsif ($ip_protocol == IPPROTO_UDP) 
+        {
+                my @udp = unpack('nnnna*', $remaining);
+
+                my $udpSrc = shift @udp; $out{'udp_sport'} = $udpSrc;
+                my $udpDst = shift @udp; $out{'udp_dport'} = $udpDst;
+                my $udpLen = shift @udp; $out{'udp_len'}   = $udpLen;
+                my $udpSum = shift @udp; $out{'udp_sum'}   = $udpSum;
+
+                $remaining = shift @udp;
+        }
+        elsif ($ip_protocol == IPPROTO_ICMP) 
+        {
+            my @icmp = unpack('CCnnna*', $remaining);
+
+            my $icmpType = shift @icmp; $out{'icmp_type'} = $icmpType;
+            my $icmpCode = shift @icmp; $out{'icmp_code'} = $icmpCode;
+            my $icmpId   = shift @icmp; 
+            my $icmpSeq  = shift @icmp;
+
+            $remaining = shift @icmp;
+        }
+        elsif ($ip_protocol == IPPROTO_ICMPV6)
+        {
+            my @icmp = unpack('CCna*', $remaining);
+
+            my $icmpType = shift @icmp; $out{'icmp_type'} = $icmpType;
+            my $icmpCode = shift @icmp; $out{'icmp_code'} = $icmpCode;
+            my $icmpSum  = shift @icmp; $out{'icmp_csum'} = $icmpSum;
+
+            $remaining = shift @icmp;
+        }
+
+        # XFF information
+        # This has already been applied to the IP information in the source.
+        if ($out{'xff'} > 0)
+        {
+                if ($out{'xff'} & TCI_IPV4)
+                {
+                        my @xff = unpack('NNa*', $remaining);
+
+                        my $clientAddr = shift @xff;
+                        my $proxyAddr  = shift @xff;
+
+                        $out{'client_addr'} = $clientAddr;
+                        $out{'proxy_addr'}  = $proxyAddr;
+
+                        $out{'client_addr_str'} = inet_ntop(AF_INET, pack('N', $clientAddr));
+                        $out{'proxy_addr_str'}  = inet_ntop(AF_INET, pack('N', $proxyAddr));
+
+                        $remaining = shift @xff;
+                }
+
+                if ($out{'xff'} & TCI_IPV6)
+                {
+                    my @xff = unpack('a16a16a*', $remaining);
+
+                        my $clientAddr = shift @xff;
+                        my $proxyAddr  = shift @xff;
+
+                        $out{'client_addr'} = $clientAddr;
+                        $out{'proxy_addr'}  = $proxyAddr;
+
+                        $out{'client_addr_str'} = inet_ntop(AF_INET6, $clientAddr);
+                        $out{'proxy_addr_str'}  = inet_ntop(AF_INET6, $proxyAddr);
+
+                        $remaining = shift @xff;
+                }
+        }
+
+        # Next event data.
+        $out{'next'} = $remaining;
+
+        return \%out;
+}
+
+sub setPacketDefaults
+{
+        my $obj = shift;
+
+        my @headers = (
+                'ip_v', 'ip_hl', 'ip_tos', 'ip_len', 'ip_id', 'ip_flags',
+                'ip_off', 'ip_ttl', 'ip_p', 'ip_sum', 'icmp_type', 'icmp_code',
+                'icmp_csum', 'tcp_sport', 'tcp_dport', 'tcp_seq', 'tcp_ack',
+                'tcp_off', 'tcp_sum', 'tcp_len', 'tcp_res', 'tcp_flags',
+                'tcp_win', 'tcp_urp', 'udp_sport', 'udp_dport', 'udp_sum',
+                'udp_len' );
+
+        foreach my $i (@headers)
+        {
+                $obj->{$i} = 0;
+        }
+
+        return;
+}
+
+sub skipConfig
+{
+        my $file = shift;
+
+        my @config;
+
+        open(SKIP, $file);
+
+        while (my $skip = <SKIP>)
+        {
+                my $sensorId;
+                my $qualifiers;
+
+                my @q;
+
+                ( $sensorId, $qualifiers ) = split(/\s+/, $skip);
+
+                @q = split(',', $qualifiers);
+
+                push @config, {
+                        'sensor_id'  => $sensorId,
+                        'qualifiers' => [@q],
+                };
+        }
+
+        close(SKIP);
+
+        return \@config;
+}
+
+sub skipMatch
+{
+        my $config = shift;
+        my $sensorId = shift;
+        my $obj = shift;
+
+        my $skipEvent = 0;
+
+        foreach my $skip (@{ $config })
+        {
+                if ($skip->{'sensor_id'} == $sensorId)
+                {
+                        my $m = 1;
+
+                        foreach my $q (@{ $skip->{'qualifiers'} })
+                        {
+                                my $a;
+                                my $b;
+
+                                ($a, $b) = split(/:/, $q);
+
+                                #
+                                # See if the event signature generator and ID
+                                # match the GID and SID specified in the
+                                # list of events to skip.
+                                #
+
+                                my $gid = $obj->{'generator_id'};
+                                my $sid = $obj->{'signature_id'};
+
+                                $m = 0 if (($a eq 'gid') && ($gid != $b));
+                                $m = 0 if (($a eq 'sid') && ($sid != $b));
+
+                                last if ($m == 0);
+                        }
+
+                        if ($m == 1)
+                        {
+                                $skipEvent = 1;
+
+                                last;
+                        }
+                }
+        }
+
+        return $skipEvent;
+}
+
+#
+# Find the parent for a response event.
+#
+
+sub findParentEvent
+{
+        my $dataObj = shift;
+        my $obj     = shift;
+
+        my $customerId = $obj->{'customer_id'};
+        my $sensorId   = $obj->{'sensor_id'};
+
+        my $parentId = $obj->{'event_update'};
+        my $pid      = $obj->{'snort_pid'};
+
+        my $special  = "$pid.$parentId";
+
+        my $query = "
+                SELECT
+                        event_id
+                FROM
+                        ${customerId}_event_tbl
+                WHERE
+                        sensor_id = ? AND
+                        special = ?
+                ORDER BY
+                        event_id DESC
+                LIMIT
+                        1";
+
+        my $results = $dataObj->execute($query, $sensorId, $special);
+
+        if (defined($results->[0]) == 0)
+        {
+                LOG("Unable to find parent event $parentId");
+
+                next;
+        }
+
+        my $eventId = $results->[0]->{'event_id'} || 0;
+
+        return $eventId;
+}
+
+#
+# Insert the processed event into the database.
+#
+
+sub insertEvent
+{
+        my $dataObj    = shift;
+        my $payloadObj = shift;
+        my $proxyObj   = shift;
+        my $queueObj   = shift;
+        my $obj        = shift;
+
+        my $customerId = $obj->{'customer_id'};
+        my $sensorId   = $obj->{'sensor_id'};
+        my $sigId      = $obj->{'signature_id'};
+        my $payload    = $obj->{'payload'};
+        my $protocol   = $obj->{'ip_p'} || 0;
+        my $snortTime  = $obj->{'snort_time'};
+        my $column     = $obj->{'column'};
+        my $response   = $obj->{'response'};
+
+        LOG("[ Inserting event ]");
+        LOG("Timestamp:      " . $obj->{'snort_time'});
+
+        #
+        # Get the signature ID.
+        #
+
+        my $query = "
+                SELECT
+                        st.signature_id AS signature_id
+                FROM
+                        signature_tbl st,
+                        signature_options_tbl so
+                WHERE
+                        st.signature_options_id = so.signature_options_id AND
+                        so.msg = ?
+                ORDER BY
+                        st.signature_id
+                LIMIT
+                        1";
+
+        my $results = $dataObj->execute($query, $sigId);
+
+        $sigId = $results->[0]->{'signature_id'} || 0;
+
+        if ($sigId == 0)
+        {
+                LOG("Unable to find signature ID $sigId");
+
+                return -1;
+        }
+
+        LOG("Signature ID:   $sigId");
+
+        #
+        # Get the severity
+        #
+
+        $query = "
+                SELECT
+                        severity, ssdl_class
+                FROM
+                        signature_tbl
+                WHERE
+                        signature_id = ?";
+
+        $results = $dataObj->execute($query, $sigId);
+        my $severity = $results->[0]->{'severity'} || 0;
+        my $ssdl_class = $results->[0]->{'ssdl_class'}|| 0;
+        $obj->{'severity'} = $severity;
+
+        #
+        # Insert the payload.
+        #
+
+        $query = "INSERT INTO ${customerId}_payload_tbl (payload, create_date) VALUES(?, ?)";
+
+        $payloadObj->execute($query, $payload, $obj->{'snort_ts_sec'});
+
+        if ($payloadObj->{'error_flag'})
+        {
+                my $msg = $payloadObj->{'error_text'};
+
+                LOG("Unable to insert payload: $msg");
+
+                return -1;
+        }
+
+        my $payloadId = $payloadObj->{'id'};
+
+        LOG("Payload ID:     $payloadId");
+
+        #
+        # Multi-header table.
+        #
+
+        LOG("Protocol:       $protocol");
+
+        my @columns;
+        my @values;
+
+        #
+        # These values are valid for all protocols.
+        #
+
+        push @values, $obj->{'ip_src_str'};
+        push @values, $obj->{'ip_dst_str'};
+        push @values, $obj->{'ip_v'};
+        push @values, $obj->{'ip_hl'};
+        push @values, $obj->{'ip_tos'};
+        push @values, $obj->{'ip_len'};
+        push @values, $obj->{'ip_id'};
+        push @values, $obj->{'ip_flags'};
+        push @values, $obj->{'ip_off'};
+        push @values, $obj->{'ip_ttl'};
+        push @values, $obj->{'ip_p'};
+        push @values, $obj->{'ip_sum'};
+
+        #
+        # Protocol-specific values.
+        #
+
+        my $protoName;
+        my $sourcePort = 0;
+        my $destPort = 0;
+
+        if ($protocol == 1)             # ICMP
+        {
+                push @columns, 'type';
+                push @columns, 'code';
+                push @columns, 'checksum';
+
+                push @values, $obj->{'icmp_type'};
+                push @values, $obj->{'icmp_code'};
+                push @values, $obj->{'icmp_csum'};
+
+                $protoName = 'icmp';
+        }
+        elsif ($protocol == 6)          # TCP
+        {
+                push @columns, 'source_port';
+                push @columns, 'dest_port';
+                push @columns, 'sequence';
+                push @columns, 'ack';
+                push @columns, 'offset';
+                push @columns, 'checksum';
+                push @columns, 'length';
+                push @columns, 'reserved';
+                push @columns, 'flags';
+                push @columns, 'window';
+                push @columns, 'urgent';
+
+                push @values, $obj->{'tcp_sport'};
+                push @values, $obj->{'tcp_dport'};
+                push @values, $obj->{'tcp_seq'};
+                push @values, $obj->{'tcp_ack'};
+                push @values, $obj->{'tcp_off'};
+                push @values, $obj->{'tcp_sum'};
+                push @values, $obj->{'tcp_len'};
+                push @values, $obj->{'tcp_res'};
+                push @values, $obj->{'tcp_flags'};
+                push @values, $obj->{'tcp_win'};
+                push @values, $obj->{'tcp_urp'};
+
+                $protoName  = 'tcp';
+                $sourcePort = $obj->{'tcp_sport'};
+                $destPort   = $obj->{'tcp_dport'};
+        }
+        elsif ($protocol == 17)         # UDP
+        {
+                push @columns, 'source_port';
+                push @columns, 'dest_port';
+                push @columns, 'checksum';
+                push @columns, 'length';
+
+                push @values, $obj->{'udp_sport'};
+                push @values, $obj->{'udp_dport'};
+                push @values, $obj->{'udp_sum'};
+                push @values, $obj->{'udp_len'};
+
+                $protoName  = 'udp';
+                $sourcePort = $obj->{'udp_sport'};
+                $destPort   = $obj->{'udp_dport'};
+        }
+        elsif ($protocol == 58)         # IPv6-ICMP
+        {
+                push @columns, 'type';
+                push @columns, 'code';
+                push @columns, 'checksum';
+
+                push @values, $obj->{'icmp_type'};
+                push @values, $obj->{'icmp_code'};
+                push @values, $obj->{'icmp_csum'};
+
+                $protoName = 'icmp6';
+        }
+        else
+        {
+                push @columns, 'checksum';
+                push @values,   0;
+
+                $protoName = $protocol;
+        }
+
+        LOG("Addresses:      " . $obj->{'ip_src_str'} . ":" . $sourcePort . " -> " .
+            $obj->{'ip_dst_str'} . ":" . $destPort);
+
+        push @values, $protoName;
+
+        my $argCount     = $#columns + 1;
+        my $protoColumns = join(',', @columns);
+        my $placeholders = '?,' x $argCount;
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_multi_header_tbl
+                (
+                        source_addr,
+                        dest_addr,
+                        version,
+                        ip_length,
+                        ip_service_type,
+                        dg_length,
+                        ip_id,
+                        ip_flags,
+                        ip_frag_offset,
+                        ip_ttl,
+                        ip_protocol,
+                        ip_checksum,
+                        $protoColumns,
+                        protocol
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        $placeholders
+                        ?
+                )";
+
+        $dataObj->execute($query, @values);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to insert event header: $msg");
+
+                return -1;
+        }
+
+        my $multiId = $dataObj->{'id'};
+
+        LOG("Header ID:      $multiId");
+
+        #
+        # Event table.
+        #
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_snort_event_tbl
+                (
+                        multi_header_id,
+                        snort_encoded_header_id,
+                        snort_ts
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?
+                )";
+
+
+        $dataObj->execute($query, $multiId, 0, $snortTime);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to insert Snort event: $msg");
+
+                return -1;
+        }
+
+        my $snortId   = $dataObj->{'id'};
+        my $eventType = 'snort';
+
+        LOG("Snort ID:       $snortId");
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_event_tbl
+                (
+                        payload_id,
+                        sensor_id,
+                        create_date,
+                        severity,
+                        signature_id,
+                        response_event,
+                        $column,
+                        ssdl_done,
+                        indicator,
+                        repeat_count,
+                        ${eventType}_event_id
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        0,
+                        ?,
+                        ?,
+                        ?
+                )";
+
+        my @args = (
+                $payloadId, $sensorId, $obj->{'snort_ts_sec'}, $obj->{'severity'},
+                $sigId, $response, $obj->{'special'}, $obj->{'indicator'},
+                $obj->{'event_count'}, $snortId );
+
+        $dataObj->execute($query, @args);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to insert event header: $msg");
+
+                return -1;
+        }
+
+        my $eventId = $dataObj->{'id'};
+
+        LOG("Event ID:       $eventId");
+
+        #
+        # event_id - batch_id relation
+        #
+
+        my $batchId  = $obj->{'batch_id'};
+        my $eventNum = $obj->{'event_num'};
+
+        $query = "
+                INSERT INTO
+                        alpha_events_tbl
+                (
+                        event_id,
+                        batch_id,
+                        event_num
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?
+                )";
+
+        @args = ($eventId, $batchId, $eventNum);
+
+        $queueObj->execute($query, @args);
+
+        if ($queueObj->{'error_flag'})
+        {
+                my $msg = $queueObj->{'error_text'};
+
+                LOG("Unable to store event_id: $msg");
+
+                return -1;
+        }
+
+        LOG("Batch ID:       $batchId");
+        LOG("Event in batch: $eventNum");
+
+        #
+        # Flat event table
+        #
+
+        if ($response == 0)
+        {
+                #
+                # Attack event
+                #
+
+                $query = "
+                        INSERT INTO
+                                ${customerId}_fast_event_tbl
+                        (
+                                event_id,
+                                severity,
+                                create_date,
+                                ssdl_done,
+                                response_count,
+                                repeat_count,
+                                source_addr,
+                                dest_addr,
+                                source_port,
+                                dest_port,
+                                protocol,
+                                signature_id,
+                                sensor_id
+                        ) VALUES (
+                                ?,
+                                ?,
+                                ?,
+                                0,
+                                0,
+                                1,
+                                ?,
+                                ?,
+                                ?,
+                                ?,
+                                ?,
+                                ?,
+                                ?
+                        )";
+
+                @args = ( $eventId, $obj->{'severity'}, $obj->{'snort_ts_sec'}, 
+                          $obj->{'ip_src'}, $obj->{'ip_dst'},
+                          $sourcePort, $destPort, $protoName, $sigId, $sensorId );
+        }
+        else
+        {
+                #
+                # Response event
+                #
+
+                $query = "
+                        UPDATE
+                                ${customerId}_fast_event_tbl
+                        SET
+                                response_count = response_count + 1
+                        WHERE
+                                event_id = ?";
+
+                @args = ( $obj->{'special'} );
+        }
+
+        $dataObj->execute($query, @args);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to update fast event table: $msg");
+
+                return -1;
+        }
+
+        if (defined($obj->{'proxy_addr'}) == 1)
+        {
+                $query = "
+                        INSERT INTO
+                                ${customerId}_proxy_address_tbl
+                        (
+                                event_id,
+                                address,
+                                create_date
+                        ) VALUES (
+                                ?,
+                                ?,
+                                ?
+                        )";
+
+                my $proxy = $obj->{'proxy_addr_str'};
+
+                LOG("Proxy address:  " . $proxy);
+                $proxyObj->execute($query, $eventId, $proxy, $obj->{'snort_ts_sec'});
+        }
+
+        # GRE information.
+        if ($obj->{'gre_layers'} > 0)
+        {
+            $query = "
+                        INSERT INTO
+                                ${customerId}_gre_tunnel_tbl
+                        (
+                                event_id,
+                                source_addr,
+                                dest_addr,
+                                create_date
+                        ) VALUES (
+                                ?,
+                                ?,
+                                ?,
+                                ?
+                        )";
+
+            if (defined($obj->{'gre_data'}))
+            {
+                for my $gre_layer (@{$obj->{'gre_data'}}) {
+                    LOG("GRE Addresses:  " . $gre_layer->{'ip_src_str'} . " -> " .
+                        $gre_layer->{'ip_dst_str'});
+                    
+                    $proxyObj->execute($query, 
+                                       $eventId, 
+                                       $gre_layer->{'ip_src_str'}, 
+                                       $gre_layer->{'ip_dst_str'},
+                                       $obj->{'snort_ts_sec'});
+                }
+            } 
+            else 
+            {
+                LOG("ERROR: GRE layers not found for event " . $eventId);
+            }
+        }
+
+        # VLAN information.
+        if ($obj->{'vlan_layers'} > 0)
+        {
+            $query = "
+                        INSERT INTO
+                                ${customerId}_vlan_tbl
+                        (
+                                event_id,
+                                priority,
+                                cfi,
+                                id,
+                                etype,
+                                create_date
+                        ) VALUES (
+                                ?,
+                                ?,
+                                ?,
+                                ?,
+                                ?,
+                                ?
+                        )";
+
+            if (defined($obj->{'vlan_data'}))
+            {
+                for my $vlan_layer (@{$obj->{'vlan_data'}}) {
+                    LOG("VLAN Priority:  " . $vlan_layer->{'priority'});
+                    LOG("VLAN CFI:       " . $vlan_layer->{'cfi'});
+                    LOG("VLAN ID:        " . $vlan_layer->{'id'});
+                    LOG("VLAN Ethertype: " . $vlan_layer->{'etype'});
+                    
+                    $proxyObj->execute($query, 
+                                       $eventId, 
+                                       $vlan_layer->{'priority'}, 
+                                       $vlan_layer->{'cfi'},
+                                       $vlan_layer->{'id'}, 
+                                       $vlan_layer->{'etype'},
+                                       $obj->{'snort_ts_sec'});
+                }
+            } 
+            else 
+            {
+                LOG("ERROR: VLAN layers not found for event " . $eventId);
+            }
+        }
+
+        if ($response == 0)
+        {
+                updateSummary($dataObj, $obj, $sigId);
+        }
+
+        LOG("[ Completed insert of event $eventId ]");
+
+        my @r = ( $eventId, $sigId, $severity, $ssdl_class );
+
+        return(@r);
+}
+
+#
+# Send an alert for the event 
+#
+
+sub sendAlert
+{
+        my $socket         = shift;
+        my $customerId     = shift;
+        my $eventId        = shift;
+        my $signatureId    = shift;
+        my $severity       = shift;
+
+        if (defined($eventId) && length($eventId))
+        {
+            print $socket (join " ", ('sendAlert', $customerId, $eventId, $signatureId, $severity)) . "\n";
+        
+        }
+        else
+        {
+            LOG("Given Event ID is either undefined or has zero length");
+        }
+}
+
+#
+# Update the summary tables that the UI uses.
+#
+
+sub updateSummary
+{
+        my $dataObj = shift;
+        my $obj     = shift;
+        my $sigId   = shift;
+
+        my $customerId = $obj->{'customer_id'};
+        my $sensorId   = $obj->{'sensor_id'};
+        my $srcAddr    = $obj->{'ip_src_str'};
+        my $dstAddr    = $obj->{'ip_dst_str'};
+        my $createDate = $obj->{'snort_ts_sec'};
+
+        my $slice = $createDate - ($createDate % 60);
+
+        my $summaryObj = AlertLogic::Base::Database->new(\%summaryConfig);
+
+        my $query;
+        my $results;
+
+        #
+        # Event traffic summary
+        #
+
+        LOG("Updating event traffic summary table");
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_event_traffic_summary
+                (
+                        time_slice,
+                        severity,
+                        sensor_id,
+                        total
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        1
+                ) ON DUPLICATE KEY UPDATE
+                        total = total + 1";
+
+        $summaryObj->execute($query, $slice, $obj->{'severity'}, $sensorId);
+
+        #
+        # Event address summary
+        #
+        # Updated twice: once for source address, once for destination
+        #
+
+        LOG("Updating event address summary table");
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_event_address_summary
+                (
+                        time_slice,
+                        severity,
+                        sensor_id,
+                        address,
+                        is_destination,
+                        total
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        1
+                ) ON DUPLICATE KEY UPDATE
+                        total = total + 1";
+
+        $summaryObj->execute($query, $slice, $obj->{'severity'}, $sensorId, $srcAddr, 0);
+        $summaryObj->execute($query, $slice, $obj->{'severity'}, $sensorId, $dstAddr, 1);
+
+        #
+        # Event location summary
+        #
+        # Updated twice: once for source address, once for destination
+        #
+
+        LOG("Updating event location summary table");
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_event_location_summary
+                (
+                        time_slice,
+                        severity,
+                        sensor_id,
+                        is_homenet,
+                        total
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        1
+                ) ON DUPLICATE KEY UPDATE
+                        total = total + 1";
+
+        my $homenetObj = AlertLogic::Base::HomeNet->new($dataObj, $customerId, $sensorId);
+        $homenetObj->fetch();
+
+        my $homenet = 0;
+
+        $homenet = $homenetObj->match($srcAddr, $obj->{'ip_v'});
+        $summaryObj->execute($query, $slice, $obj->{'severity'}, $sensorId, $homenet);
+
+        #
+        # Event signature summary
+        #
+
+        LOG("Updating event signature summary table");
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_event_signature_summary
+                (
+                        time_slice,
+                        severity,
+                        sensor_id,
+                        signature_id,
+                        total
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        1
+                ) ON DUPLICATE KEY UPDATE
+                        total = total + 1";
+
+        $summaryObj->execute($query, $slice, $obj->{'severity'}, $sensorId, $sigId);
+
+        #
+        # Get the sensor's zone ID.
+        #
+
+        $query   = "SELECT zone_id FROM sensor_tbl WHERE sensor_id = ?";
+        $results = $dataObj->execute($query, $sensorId);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to find zone for sensor $sensorId: $msg");
+
+                return;
+        }
+
+        my $zoneId = $results->[0]->{'zone_id'} || 0;
+
+        if ($zoneId == 0)
+        {
+                LOG("Invalid zone ID for sensor $sensorId");
+
+                return;
+        }
+
+        #
+        # Get the host and netblock information for the event target.
+        #
+
+        $query = "
+                SELECT
+                        host_id,
+                        netblock_id,
+                        criticality
+                FROM
+                        ${customerId}_host_tbl
+                WHERE
+                        ip_address = INET_NTOA(?)";
+
+        $results = $dataObj->execute($query, $dstAddr);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to retrieve host information for address $dstAddr: $msg");
+
+                return;
+        }
+
+        my $hostId      = $results->[0]->{'host_id'}     || 0;
+        my $netblockId  = $results->[0]->{'netblock_id'} || 0;
+        my $criticality = $results->[0]->{'criticality'} || 0;
+
+        if ($hostId > 0)
+        {
+                my $vulnCount;
+                my $netblockCount;
+
+                #
+                # Get the number of known vulnerabilities for this host.
+                #
+
+                $query = "
+                        SELECT
+                                COUNT(has_known_vuln_id) AS vuln_count
+                        FROM
+                                ${customerId}_nessus_known_vulnerability_tbl
+                        WHERE
+                                host_id = ?";
+
+                $results   = $dataObj->execute($query, $hostId);
+                $vulnCount = $results->[0]->{'vuln_count'} || 0;
+
+                #
+                # Get the number of netblocks inside of the sensor's zone.
+                #
+
+                $query = "
+                        SELECT
+                                COUNT(netblock_id) AS netblock_count
+                        FROM
+                                ${customerId}_netblock_tbl
+                        WHERE
+                                zone_id = ?";
+
+                $results       = $dataObj->execute($query, $zoneId);
+                $netblockCount = $results->[0]->{'netblock_count'} || 0;
+
+                #
+                # Get the vulnerability data for all of the host's known vulnerabilities.
+                #
+
+                $query = "
+                        SELECT
+                                vet.vulnerability_id,
+                                kvt.risk_level
+                        FROM
+                                signature_tbl st,
+                                vulnerability_list_entries_tbl vet,
+                                ${customerId}_nessus_known_vulnerability_tbl kvt
+                        WHERE
+                                st.vulnerability_list_id = vet.vulnerability_list_id AND
+                                vet.vulnerability_id = kvt.vulnerability_id AND
+                                st.signature_id = ? AND
+                                kvt.host_id = ?";
+
+                $results = $dataObj->execute($query, $sigId, $hostId);
+
+                foreach my $result (@{ $results })
+                {
+                        my $vulnId    = $result->{'vulnerability_id'};
+                        my $riskLevel = $result->{'risk_level'};
+
+                        #
+                        # Most at risk hosts summary
+                        #
+
+                        LOG("Updating most at risk hosts summary table");
+
+                        $query = "
+                                INSERT INTO
+                                        ${customerId}_most_at_risk_hosts_summary
+                                (
+                                        time_slice,
+                                        host_id,
+                                        zone_id,
+                                        hostgroup_id,
+                                        risk_level,
+                                        vulnerability_id,
+                                        criticality,
+                                        total_events,
+                                        total_hostgroups,
+                                        total_exposures
+                                ) VALUES (
+                                        ?,
+                                        ?,
+                                        ?,
+                                        ?,
+                                        ?,
+                                        ?,
+                                        ?,
+                                        1,
+                                        ?,
+                                        ?
+                                ) ON DUPLICATE KEY UPDATE
+                                        total_events = total_events + 1,
+                                        total_hostgroups = ?,
+                                        total_exposures = ?";
+
+                        my @args = ( $slice, $hostId, $zoneId, $netblockId, $riskLevel,
+                                     $vulnId, $criticality, $netblockCount, $vulnCount,
+                                     $netblockCount, $vulnCount);
+
+                        $summaryObj->execute($query, @args);
+
+                        #
+                        # Targeted vulnerabilities summary
+                        #
+
+                        LOG("Updating targeted vulnerabilities summary");
+
+                        $query = "
+                                INSERT INTO
+                                        ${customerId}_targeted_vulnerabilities_summary
+                                (
+                                        time_slice,
+                                        zone_id,
+                                        hostgroup_id,
+                                        risk_level,
+                                        vulnerability_id,
+                                        total
+                                ) VALUES (
+                                        ?,
+                                        ?,
+                                        ?,
+                                        ?,
+                                        ?,
+                                        1
+                                ) ON DUPLICATE KEY UPDATE
+                                        total = total + 1";
+
+                        @args = ( $slice, $zoneId, $netblockId, $riskLevel, $vulnId );
+                        $summaryObj->execute($query, @args);
+                }
+        }
+
+        #
+        # Get the classification for the signature that triggered the event.
+        #
+
+        $query   = "SELECT signature_class_id FROM signature_tbl WHERE signature_id = ?";
+        $results = $dataObj->execute($query, $sigId);
+
+        if ($dataObj->{'error_flag'})
+        {
+                my $msg = $dataObj->{'error_text'};
+
+                LOG("Unable to retrieve classification for signature $sigId: $msg");
+
+                return;
+        }
+
+        my $classId = $results->[0]->{'signature_class_id'} || 0;
+
+        if ($classId == 0)
+        {
+                LOG("Invalid classification for signature $sigId");
+
+                return;
+        }
+
+        #
+        # Event classification summary
+        #
+
+        LOG("Updating event classification summary table");
+
+        $query = "
+                INSERT INTO
+                        ${customerId}_event_class_summary
+                (
+                        time_slice,
+                        severity,
+                        sensor_id,
+                        classification_id,
+                        total
+                ) VALUES (
+                        ?,
+                        ?,
+                        ?,
+                        ?,
+                        1
+                ) ON DUPLICATE KEY UPDATE
+                        total = total + 1";
+
+        $summaryObj->execute($query, $slice, $obj->{'severity'}, $sensorId, $classId);
+
+        return;
+}
+
+sub LOG
+{
+        my $message = shift;
+
+        my @now = localtime(time());
+
+        my $mon  = $now[4] + 1;
+        my $day  = $now[3];
+        my $hour = $now[2];
+        my $min  = $now[1];
+        my $sec  = $now[0];
+
+        printf("%02d/%02d %02d:%02d:%02d %s\n", $mon, $day, $hour, $min, $sec, $message);
+
+        return;
+}
+

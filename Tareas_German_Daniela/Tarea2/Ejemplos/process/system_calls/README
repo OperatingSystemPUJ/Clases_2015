@@ -1,0 +1,68 @@
+Este directorio contiene algunos programas en C que muestran ejemplos del uso del API de procesos de un SO.
+
+Estos son los archivos que contiene el presente directorio:
+- makefile: archivo usado para compilar los programas en este directorio
+- run.sh: un script en bash que le permitira ejecutar un programa un numero 
+determinado de veces
+- fork_00.c: programa que pretende mostrar como un padre y un hijo corren 
+de forma simultanea
+- fork_01.c: programa que muestra como las variables de un padre y un hijo
+no se comparten 
+- execs.c: programa que muestra el uso de la familia de funciones exec()
+- sendmail.c: programa que muestra el envio de correos usando pipes. 
+- forks.c: programa que muestra diferentes formas de llamar la funcion fork().
+- vfork.cc: 
+- README: este archivo
+
+Ejecutando el codigo
+====================
+fork_00
+-------
+ Este codigo pretende mostrar que una vez un programa en C invoca la funcion fork() esto causa que dos procesos "iguales" se encuentren ahora en el sistema y ejecutandose de forma independiente.
+ El estudiante debera ejecutar los siguientes pasos:
+ 1- Compilar el codigo y luego ejecutarlo
+  a- Ejecute el comando "make all"
+  b- Ejecute el comando "./run.sh fork_00"
+  c- Explique lo que observa
+
+2- Edite el archivo fork_00.c y encuentre un comentario en el  codigo numerado
+con el valor "1.". Proceda a descomentar las lineas y repita los pasos del item
+1- en este documento
+
+3- Edite el archivo fork_00.c y encuentre un comentario en el codigo numerado
+con el valor "2.". Proceda a descomentar las lineas y repita los pasos del item
+1- en este documento
+
+fork_01
+-------
+ Este codigo muestra como procesos creados con la instruccion fork() NO 
+comparten variables. El estudiante debera 
+a- Compilar el programa fork_01.c, "make fork_01"
+b- Ejecutar el programa fork_01, "./fork_01"
+c- Que observa?
+
+Ejercicio #1
+============
+Modifique el programa fork_01 en C de modo que el padre sea quien imprima los
+valores que el hijo le asigno a las variables local y global.
+
+
+Practica con sqlite3
+====================
+1. sudo apt-get install sqlite3
+2. sudo apt-get install libsqlite3-dev
+3. sqlite3 data.db < create.sql
+4. sqlite data.db
+5. .tables
+6. .schema people
+7. select * from people;
+8. .quit
+9. gcc -o sqlite_00 sqlite_00.c -lsqlite3
+10. ./sqlite_00
+
+sendmail.c
+==========
+1. sudo apt-get install heirloom-mailx
+2. Open and change your email credentials 
+3. gcc -o sendmail sendmail.c 
+
