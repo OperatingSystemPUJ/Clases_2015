@@ -1,0 +1,9 @@
+*Para el email_service se necesita mailutils instalado en linux
+*Para ejecutar el purchase_service se necesita que entre como argumento la direccion del email_service
+Exp:
+./purchase_service 192.168.250.68
+*Para ejecutar el pruchase_service_client se necesita que entre como argumento la direccion del purchase_service
+Exp:
+./purchase_service_client 192.168.250.68
+*En el archivo purchase_service.sql existe la base dedatos y un usuario de prueba.
+*tener encuenta tener sqllite3 instalado al igual que sus librerias para c.
