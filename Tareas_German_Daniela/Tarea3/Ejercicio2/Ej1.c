@@ -1,3 +1,6 @@
+/*1. Ejecute varias veces el codigo, que observa? es correcto? tiene algun error?
+   Justifique su respuesta.*/
+
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,12 +9,6 @@
 #define ARRAYSIZE   1000000
 #define ITERATIONS   ARRAYSIZE / NTHREADS
 
-//Ejecute varias veces el codigo, que observa? es correcto? tiene algun error?
-//Justifique su respuesta.
-///////////////////////////////////
-//Respuesta
-//el codigo hace la suma de los primeros n numeros, el codigo usa los mutex para ayudar en la seccion critica
-//entre los hilos y asi no causar problemas coherencia, por tanto no tiene ningun error.
 double  sum=0.0, a[ARRAYSIZE];
 pthread_mutex_t sum_mutex;
 
@@ -29,12 +26,11 @@ void *do_work(void *tid)
 		a[i] = i * 1.0;
 		mysum = mysum + a[i];
 	}
-	sleep(1);
 
 	/* Lock the mutex and update the global sum, then exit */
-	pthread_mutex_lock (&sum_mutex); //seccion critica
+	pthread_mutex_lock (&sum_mutex);
 	sum = sum + mysum;
-	pthread_mutex_unlock (&sum_mutex); //seccionciritica
+	pthread_mutex_unlock (&sum_mutex);
 	pthread_exit(NULL);
 }
 
@@ -71,3 +67,8 @@ int main(int argc, char *argv[])
 	pthread_mutex_destroy(&sum_mutex);
 	pthread_exit (NULL);
 }
+
+//Ya lo ejecute varias veces!!
+//Lo que hace el codigo es sumar los primero n numeros donde la variable sum se encuentra 
+//ejecutada por varios hilos pero con el mutex ayuda a que no hayan problemas de coherencia
+//por lo tanto, el programa es correcto!.

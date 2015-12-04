@@ -1,0 +1,24 @@
+Sebastian Lozano Herrera - Juan Pablo Mejía Duque.
+
+
+1. En el primer ejercicio de sección crítica encontramos que aunque las acciones de los hilos son estáticas
+la definición de una sección crítica es necesaria ya que cuando los hilos acceden a la variable sum siempre 
+haran el mismo cambio, pero si una interrupción no deja terminar la ejecución del hilo activo dará pie a la 
+ejecución del siguiente y esto hace que los valores cambien.
+
+Ejemplo sin seccion critica:
+Done. Sum= 3.437496e+11 
+Check Sum= 4.999995e+11
+
+Por otro lado la ubicación de la seccion crítica es correcta ya que al tratar de simular la interrupcion 
+la seccion critica bloquea el acceso a los hilos que no estan activos y la ejecucion se ordena.
+
+2. La solución está en el archivo threads2.c
+
+3. En el tercer ejercicio ocurre algo similar al primero ya que existen 8 hilos los cuales hacen operaciones sobre
+la variable sum, que es una variable global, alterando su valor con los valores que están en los vectores a y b. El problema de este ejercicio es que no se ha definido un mutex para evitar que una interrupción altere el curso de la
+ejecución. La solución es definir el mutex en el sitio donde se realizan los cambios a la variable sum y está en el 
+archivo 3.c.
+
+4. En el cuarto ejercicio se tiene 5 hilos que son creados en el main pero el resultado de la operacion que hacen los hilos no es visible porque el proceso que los crea termina antes que cualquiera de los hilos, asi que para solucionar esto se debe agregar un ciclo que contenga el join de los hilos, así como se encuentra en los ejercicios anteriores. La solución
+esta en el archivo 4.c.
